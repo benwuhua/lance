@@ -108,6 +108,7 @@ test_data/venv
 
 # Pytest benchmarks
 .benchmarks/
+.worktree/
 
 # Auto-built docs
 docs/src/format/namespace/**
