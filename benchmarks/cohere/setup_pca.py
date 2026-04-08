@@ -231,6 +231,8 @@ def main():
     parser.add_argument("--sample-size", type=int, default=500_000, help="Vectors for SVD training")
     parser.add_argument("--batch-size", type=int, default=2_000_000, help="Rows per write batch")
     parser.add_argument("--train-shard", type=int, default=0, help="Shard to sample for SVD training")
+    parser.add_argument("--index-type", default="IVF_RQ", choices=["IVF_RQ", "IVF_SQ"],
+                        help="Index type to build (default: IVF_RQ)")
     parser.add_argument("--only-shard", type=int, default=None,
                         help="Process only this single shard ID (skips SVD training)")
     parser.add_argument("--convert-gt", default=None,
@@ -276,12 +278,12 @@ def main():
         transform_shard(source_path, output_path, components, args.column, args.batch_size)
         print(f"  Transform done in {time.time() - t0:.0f}s")
 
-        print(f"Shard {i}: building IVF_RQ index ({args.num_partitions:,} partitions)...")
+        print(f"Shard {i}: building {args.index_type} index ({args.num_partitions:,} partitions)...")
         shard_ds = lance.dataset(output_path)
         t0 = time.time()
         shard_ds.create_index(
             column=args.column,
-            index_type="IVF_RQ",
+            index_type=args.index_type,
             metric=args.metric,
             num_partitions=args.num_partitions,
         )
@@ -324,12 +326,12 @@ def main():
         print(f"  Transform done in {time.time() - t0:.0f}s")
 
         # Build index
-        print(f"Shard {i}: building IVF_RQ index ({args.num_partitions:,} partitions)...")
+        print(f"Shard {i}: building {args.index_type} index ({args.num_partitions:,} partitions)...")
         shard_ds = lance.dataset(output_path)
         t0 = time.time()
         shard_ds.create_index(
             column=args.column,
-            index_type="IVF_RQ",
+            index_type=args.index_type,
             metric=args.metric,
             num_partitions=args.num_partitions,
         )

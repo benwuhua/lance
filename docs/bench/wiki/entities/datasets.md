@@ -39,6 +39,16 @@ nprobe range = 1-5% x 13,107 = 131-655
 - **SVD model**: `/data/work/tmp/s1b-pca512/svd_model.pkl`
 - **Status**: Complete, all 5 shards indexed and on OBS
 
+## PCA-512 + IVF_SQ (Scalar Quantization)
+
+- **Rows**: Same as PCA-512 (copies of the same vectors)
+- **Dimensions**: 512 (float32, L2-normalized)
+- **Index**: IVF_SQ, 13,107 partitions/shard, 8-bit scalar quantization
+- **Shard size**: 466GB/shard (SQ codes ~100GB + raw vectors ~386GB)
+- **Local**: `/data/work/tmp/s1b-pca512-sq/shard-{0-4}.lance`
+- **OBS**: `s3://knowledgebase-5f43/pca512-sq-1b/`
+- **Status**: Complete, tested — **SQ is slower than RQ everywhere** (see [pca512-sq experiment](../experiments/pca512-sq.md))
+
 ## 324M FineWeb-Edu (Legacy)
 
 - **Rows**: ~324M (4 shards x ~81M)

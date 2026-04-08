@@ -2,6 +2,19 @@
 
 Chronological record of wiki activity.
 
+## [2026-04-08] ingest | IO Threads Experiment (128 vs 512)
+- Source: OBS benchmark with LANCE_IO_THREADS=512
+- Key finding: 512 threads gave <1% improvement over 128 — bottleneck is not thread count
+- Conclusion: per-query IO scheduling, not global thread pool, is the bottleneck
+
+## [2026-04-08] ingest | PCA-512 + IVF_SQ Experiment
+- Source: benchmark results from ECS (`/data/work/tmp/pca512-sq-results/`)
+- Pages created: [pca512-sq](experiments/pca512-sq.md)
+- Key finding: **SQ is slower everywhere** — SQ stores codes ON TOP of original vectors (466GB vs 386GB/shard)
+- DRAM: 2-3x slower (SQ index exceeds page cache), OBS: 10-100% slower (more S3 GET requests)
+- SQ recall ceiling 0.972 at rf≥2, but high rf doesn't help because SQ doesn't replace float32 vectors
+- Conclusion: SQ8 needs to replace (not supplement) original vectors — requires index format change
+
 ## [2026-04-08] ingest | 1B Baseline Results (DRAM + SSD + OBS)
 - Source: benchmark results from ECS
 - Pages created: [1b-baseline](experiments/1b-baseline.md)

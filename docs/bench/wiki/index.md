@@ -35,6 +35,9 @@ Primary benchmark: 972M rows, 1024-dim, IVF_RQ. DRAM/SSD/OBS results across 14 c
 ### [PCA-512](experiments/pca512.md)
 TruncatedSVD 1024→512 dim reduction. Recall ceiling ~0.97, DRAM 10% faster at low nprobe, OBS 3-7% faster. Best for OBS with recall <= 0.95.
 
+### [PCA-512 + IVF_SQ](experiments/pca512-sq.md)
+IVF_SQ (8-bit scalar quantization) on PCA-512. **Slower than RQ everywhere** — SQ stores codes on top of original vectors (466GB vs 386GB/shard). OBS 10-100% slower. SQ needs to replace (not supplement) float32 vectors to be useful.
+
 ### [Exact Rerank](experiments/exact-rerank.md) (Abandoned)
 Post-merge exact rerank via take(). Abandoned: random access to columnar storage 5x slower than built-in refinement.
 

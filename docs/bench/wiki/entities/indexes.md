@@ -57,4 +57,5 @@ See [metrics](../concepts/metrics.md) for recall measurement methodology.
 |---------|-----|------------|------------|------------|
 | 1B baseline | 1024 | 13,107 | ~132GB | 194M |
 | PCA-512 | 512 | 13,107 | ~66GB | 194M |
+| PCA-512 + SQ | 512 | 13,107 | ~100GB/shard (SQ codes) + 386GB/shard (vectors) | 194M |
 | 324M | 1024 | 1,125 | ~44GB | 81M |

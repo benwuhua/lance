@@ -844,7 +844,7 @@ def add_common_args(p: argparse.ArgumentParser):
     """Arguments shared across all subcommands."""
     p.add_argument("--column", default="vector", help="Vector column name")
     p.add_argument("--metric", default="cosine", choices=["L2", "cosine", "dot"])
-    p.add_argument("--index-type", default="IVF_RQ", choices=["IVF_PQ", "IVF_RQ"])
+    p.add_argument("--index-type", default="IVF_RQ", choices=["IVF_PQ", "IVF_RQ", "IVF_SQ"])
 
     # OBS credentials
     p.add_argument("--endpoint", default="https://obs.ap-southeast-1.myhuaweicloud.com")
