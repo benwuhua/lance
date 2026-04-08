@@ -48,25 +48,42 @@ Test whether IVF_SQ (Scalar Quantization, 8-bit per dimension) on PCA-512 data c
 
 ## Findings
 
-1. **SQ is slower everywhere — both DRAM and OBS.** This is the opposite of what we expected.
+### Matched-Recall Comparison (OBS, the key insight)
 
-2. **SQ index is larger, not smaller**: 466GB/shard (SQ) vs 386GB/shard (RQ). SQ stores uint8 codes for every dimension (512B/vector = 100GB/shard) ON TOP of the original float32 vectors. RQ stores only ~4B/vector of residual codes. **SQ does not replace the original vectors** — refine_factor still reads them.
+SQ rf=1 recall (0.958-0.965) already exceeds RQ rf=2 recall (0.942-0.953).
+On OBS, **SQ rf=1 is 35-44% faster** than RQ rf=2 at the same recall level:
 
-3. **Recall ceiling at 0.972**: SQ quantization error plateaus at rf≥2. The 8-bit per-dimension quantization is more accurate than RQ at low rf (0.958 vs 0.790 at rf=1), but hits its ceiling earlier.
+| Target Recall | SQ Config | SQ OBS | RQ Config | RQ OBS | SQ Advantage |
+|--------------|-----------|--------|-----------|--------|-------------|
+| ~0.95 | np=128 rf=1 (0.958) | **10,518ms** | np=128 rf=2 (0.942) | 18,729ms | **44% faster** |
+| ~0.96 | np=256 rf=1 (0.962) | **12,508ms** | np=256 rf=2 (0.948) | 19,306ms | **35% faster** |
+| ~0.97 | np=1024 rf=2 (0.972) | 32,103ms | np=1024 rf=2 (0.953) | 20,594ms | -56% (SQ worse) |
 
-4. **DRAM 2-3x slower**: SQ index (100GB/shard) exceeds page cache capacity. The system is IO-bound reading SQ codes + original vectors from disk.
+**Why**: SQ 8-bit quantization is more accurate than RQ 1-bit residual, so SQ rf=1 doesn't need refinement. On OBS, rf=2 downloads 20,000 original float32 vectors (~10s). SQ rf=1 skips this entirely — only reads SQ uint8 codes.
 
-5. **OBS 10-100% slower**: Larger index = more S3 GET requests = more RTT. np=1024 rf=1 went from 11.4s to 22.9s because the SQ index is 2.3TB total (vs ~66GB for RQ).
+### Matched-rf Comparison (less favorable for SQ)
 
-6. **Root cause**: Lance's IVF_SQ stores SQ codes alongside original float32 vectors. The SQ codes are NOT used as a replacement for original vectors during refinement. refine_factor still reads the full float32 vectors. So the total data read = SQ codes (for initial scan) + float32 vectors (for refinement), which is MORE than RQ (which only reads RQ codes + float32 vectors for refinement).
+At same rf, SQ is slower because the SQ index is larger:
+- SQ index: 466GB/shard (SQ codes ~100GB + raw vectors ~386GB)
+- RQ index: 386GB/shard (RQ codes ~0.8GB + raw vectors ~386GB)
+- Larger index → more S3 GET requests → more RTT overhead
 
-## Why SQ8 Should Be Better (In Theory)
+### DRAM
 
-SQ8's advantage is when used as a **fast rerank layer WITHIN the index**, replacing the need to read original float32 vectors:
-- SQ8 distance: uint8 arithmetic, ~10x faster than float32
-- SQ8 storage: 512 bytes/vector, not 2KB (float32) or 4KB (1024-dim float32)
+SQ is 2-3x slower at matched rf because the 100GB SQ index per shard exceeds page cache (493GB total RAM, 5×100GB = 500GB SQ codes alone). But at matched recall, SQ rf=1 (993ms at 0.958) vs RQ rf=2 (875ms at 0.942) — SQ is only slightly slower on DRAM but has higher recall.
 
-But Lance's current implementation doesn't do this. It stores SQ codes AND original vectors, using SQ only for the initial scan.
+### Recall Ceiling
+
+SQ recall plateaus at 0.972 at rf≥2. This is a hard ceiling from the 8-bit quantization error. RQ continues improving past 0.97 with higher rf (RQ np=1024 rf=3 = 0.967, rf=5 = 0.971).
+
+## When to Use SQ vs RQ
+
+| Scenario | Winner | Reason |
+|----------|--------|--------|
+| OBS, recall ≤ 0.96 | **SQ** | rf=1 sufficient, saves ~10s of vector download |
+| OBS, recall > 0.97 | **RQ** | SQ can't reach 0.99+, RQ with rf=3+ can |
+| DRAM | **RQ** | RQ index fits in page cache, SQ doesn't |
+| SSD | **RQ** | Same reason as DRAM |
 
 ## Recommendation
 
