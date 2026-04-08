@@ -105,6 +105,27 @@ def compute_recall_at_k(
     return sum(recalls) / len(recalls)
 
 
+def compute_exact_distances(
+    query_vec: np.ndarray,
+    vectors: np.ndarray,
+    metric: str,
+) -> np.ndarray:
+    """Compute exact distances between a query vector and candidate vectors."""
+    if metric == "cosine":
+        dots = vectors @ query_vec
+        q_norm = np.linalg.norm(query_vec)
+        v_norms = np.linalg.norm(vectors, axis=1)
+        cos_sim = dots / (q_norm * v_norms + 1e-10)
+        return 1.0 - cos_sim
+    elif metric == "L2":
+        diff = vectors - query_vec
+        return np.sum(diff * diff, axis=1)
+    elif metric == "dot":
+        return -(vectors @ query_vec)
+    else:
+        raise ValueError(f"Unsupported metric for exact rerank: {metric}")
+
+
 def generate_ground_truth(
     dataset,
     query_vectors: np.ndarray,
@@ -270,6 +291,37 @@ def query_plan_a(
 # ── Query: Plan B (sharded, serial) ─────────────────────────────────
 
 
+def _rowid_to_position(dataset, rowids: np.ndarray) -> np.ndarray:
+    """Convert _rowid values (fragment_id<<32|offset) to 0-based positional indices.
+
+    _rowid is lance's internal row address: (fragment_id: u32 << 32) | (row_offset: u32).
+    take() expects 0-based positional indices, so we need this conversion.
+    """
+    fragments = list(dataset.get_fragments())
+    frag_base = {}
+    cumulative = 0
+    for frag in fragments:
+        frag_base[frag.fragment_id] = cumulative
+        cumulative += frag.count_rows()
+
+    original_shape = rowids.shape
+    rowids_u64 = rowids.astype(np.uint64).ravel()
+    frag_ids = (rowids_u64 >> 32).astype(np.int32)
+    offsets = (rowids_u64 & 0xFFFFFFFF).astype(np.int64)
+
+    # Vectorized lookup: build array indexed by fragment_id
+    if len(frag_base) > 0:
+        max_frag_id = max(frag_base.keys())
+        lookup = np.zeros(max_frag_id + 1, dtype=np.int64)
+        for fid, base in frag_base.items():
+            lookup[fid] = base
+        bases = lookup[frag_ids]
+    else:
+        bases = np.zeros(len(frag_ids), dtype=np.int64)
+
+    return (bases + offsets).reshape(original_shape)
+
+
 def _query_single_shard(
     ds,
     qvec,
@@ -303,10 +355,15 @@ def query_plan_b(
     warmup: int,
     drop_between: bool = False,
     max_workers: int | None = None,
+    rerank_factor: int = 0,
 ) -> dict:
     """Plan B: parallel shard queries via ThreadPoolExecutor + merge top-K.
 
     Uses threads (not processes) because lance releases GIL during Rust IO.
+
+    When rerank_factor > 0, after approximate merge, fetches original vectors
+    for top-K*rerank_factor candidates and computes exact distances for re-ranking.
+    This produces accurate distances and higher recall without increasing refine_factor.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -321,7 +378,7 @@ def query_plan_b(
 
         start = time.perf_counter()
 
-        # Query all shards in parallel via threads
+        # Query all shards in parallel via threads (no vectors, fast)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
@@ -336,12 +393,52 @@ def query_plan_b(
                 idx = futures[future]
                 partial_results[idx] = future.result()
 
-        # Merge: concat all (rowid, distance) pairs, sort by distance, take top-K
+        # Merge: concat all (rowid, distance) pairs with shard origin
         all_rowids = np.concatenate([r[0] for r in partial_results])
         all_dists = np.concatenate([r[1] for r in partial_results])
-        sorted_idx = np.argsort(all_dists)[:top_k]
-        merged_rowids = all_rowids[sorted_idx]
-        merged_dists = all_dists[sorted_idx]
+        all_shard_ids = np.concatenate(
+            [np.full(len(r[0]), i, dtype=np.int32) for i, r in enumerate(partial_results)]
+        )
+
+        if rerank_factor > 0:
+            # Take more candidates for exact rerank
+            n_candidates = min(top_k * rerank_factor, len(all_rowids))
+            sorted_idx = np.argsort(all_dists)[:n_candidates]
+            cand_rowids = all_rowids[sorted_idx]
+            cand_shard_ids = all_shard_ids[sorted_idx]
+
+            # Fetch original vectors per shard in parallel (only for rerank candidates)
+            # Convert _rowid → positional index, then take()
+            exact_dists = np.empty(n_candidates, dtype=np.float64)
+
+            def _fetch_and_score(shard_id):
+                mask = cand_shard_ids == shard_id
+                if not np.any(mask):
+                    return shard_id, mask, np.array([]), np.array([])
+                rowids = cand_rowids[mask]
+                positions = _rowid_to_position(datasets[shard_id], rowids)
+                vec_table = datasets[shard_id].take(
+                    positions.tolist(), columns=[column]
+                )
+                vecs = np.stack(vec_table[column].to_pylist())
+                dists = compute_exact_distances(qvec, vecs, metric)
+                return shard_id, mask, vecs, dists
+
+            with ThreadPoolExecutor(max_workers=num_shards) as pool:
+                for shard_id, mask, vecs, dists in pool.map(
+                    _fetch_and_score, range(num_shards)
+                ):
+                    if len(dists) > 0:
+                        exact_dists[mask] = dists
+
+            # Final sort by exact distance
+            final_idx = np.argsort(exact_dists)[:top_k]
+            merged_rowids = cand_rowids[final_idx]
+            merged_dists = exact_dists[final_idx]
+        else:
+            sorted_idx = np.argsort(all_dists)[:top_k]
+            merged_rowids = all_rowids[sorted_idx]
+            merged_dists = all_dists[sorted_idx]
 
         elapsed = (time.perf_counter() - start) * 1000.0
 
@@ -349,7 +446,7 @@ def query_plan_b(
             latency_ms.append(elapsed)
             ann_ids_per_query.append(merged_rowids)
 
-    return {
+    result = {
         "plan": "B",
         "num_shards": num_shards,
         "workers": workers,
@@ -357,6 +454,9 @@ def query_plan_b(
         "query_count": len(latency_ms),
         "ann_ids": ann_ids_per_query,
     }
+    if rerank_factor > 0:
+        result["rerank_factor"] = rerank_factor
+    return result
 
 
 # ── Open datasets ────────────────────────────────────────────────────
@@ -500,12 +600,13 @@ def cmd_query(args):
     dataset_uri = getattr(args, "dataset_uri", None)
 
     # Prepare storage (warm cache for DRAM, initial drop for SSD)
-    if storage == "dram" and shard_dir:
+    no_warm = getattr(args, "no_warm", False)
+    if storage == "dram" and shard_dir and not no_warm:
         print(f"Warming page cache for {shard_dir}...")
         t0 = time.perf_counter()
         warm_page_cache(shard_dir, args.num_shards)
         print(f"  Page cache warmed in {time.perf_counter() - t0:.1f}s")
-    elif storage == "dram" and dataset_uri and not dataset_uri.startswith("s3://"):
+    elif storage == "dram" and dataset_uri and not dataset_uri.startswith("s3://") and not no_warm:
         print(f"Warming page cache for {dataset_uri}...")
         t0 = time.perf_counter()
         warm_page_cache_single(dataset_uri)
@@ -559,11 +660,13 @@ def cmd_query(args):
           f"{' (drop_caches before each)' if drop_between else ''}...")
 
     query_fn = query_plan_a if plan == "A" else query_plan_b
+    rerank_factor = getattr(args, "rerank_factor", 0)
     query_args = dict(
         column=column, metric=metric,
         top_k=top_k, nprobes=nprobes,
         refine_factor=refine_factor, warmup=warmup,
         drop_between=drop_between,
+        rerank_factor=rerank_factor if plan == "B" else 0,
     )
 
     if plan == "A":
@@ -579,12 +682,20 @@ def cmd_query(args):
 
     # Compute recall if requested
     recall_k = getattr(args, "recall_k", None)
-    if recall_k and plan == "B" and not is_obs:
-        print(f"\nComputing recall@{recall_k} against flat search on shard-0...")
-        gt_ids = generate_ground_truth(
-            datasets[0], query_vectors[warmup:],
-            column=column, top_k=recall_k, metric=metric,
-        )
+    gt_path = getattr(args, "gt_path", None)
+    if (recall_k or gt_path) and plan == "B" and not is_obs:
+        if gt_path:
+            print(f"\nLoading ground truth from {gt_path}...")
+            gt_data = np.load(gt_path)
+            gt_ids = [gt_data[k] for k in sorted(gt_data.files)]
+            recall_k = len(gt_ids[0])
+            print(f"  GT: {len(gt_ids)} queries, k={recall_k} (positional indices)")
+        else:
+            print(f"\nComputing recall@{recall_k} against flat search on shard-0...")
+            gt_ids = generate_ground_truth(
+                datasets[0], query_vectors[warmup:],
+                column=column, top_k=recall_k, metric=metric,
+            )
         # Re-run ANN on shard-0 only to get per-shard results
         ann_ids_shard0 = []
         for qi in range(warmup, query_count):
@@ -595,7 +706,12 @@ def cmd_query(args):
                     metric=metric, nprobes=nprobes, refine_factor=refine_factor,
                 ),
             )
-            ann_ids_shard0.append(result_s0["_rowid"].to_numpy())
+            ann_rowids = result_s0["_rowid"].to_numpy()
+            if gt_path:
+                # GT uses positional indices; convert ANN _rowid to positional
+                ann_ids_shard0.append(_rowid_to_position(datasets[0], ann_rowids))
+            else:
+                ann_ids_shard0.append(ann_rowids)
 
         recall = compute_recall_at_k(ann_ids_shard0, gt_ids, recall_k)
         result[f"recall_at_{recall_k}"] = recall
@@ -757,6 +873,14 @@ def add_query_args(p: argparse.ArgumentParser):
     p.add_argument("--result-path", default=None)
     p.add_argument("--recall-k", type=int, default=None,
                    help="Compute recall@K against flat search (default: same as top-k)")
+    p.add_argument("--rerank-factor", type=int, default=0,
+                   help="Exact rerank factor: fetch original vectors for top-K*N candidates "
+                        "and compute exact distances for re-ranking (0=disabled)")
+    p.add_argument("--no-warm", action="store_true",
+                   help="Skip page cache warming for DRAM runs")
+    p.add_argument("--gt-path", default=None,
+                   help="Pre-computed GT .npz with positional indices (skips GT generation, "
+                        "enables cross-dataset recall e.g. PCA vs original vectors)")
 
     # Data source (at least one required depending on plan)
     p.add_argument("--dataset-uri", default=None,
