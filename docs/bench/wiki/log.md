@@ -2,6 +2,12 @@
 
 Chronological record of wiki activity.
 
+## [2026-04-09] ingest | PCA-512 + IVF_SQ SSD Sweep
+- Source: ECS SSD benchmark (drop_caches before each query)
+- Pages updated: [pca512-sq](experiments/pca512-sq.md)
+- 10 configs: np=[128,256,512,1024] × rf=[1,2] + np=1024 × rf=[3,5]
+- Key finding: SSD cold cache overhead only +10-22% over DRAM, IO not bottleneck
+
 ## [2026-04-08] ingest | IO Threads Experiment (128 vs 512)
 - Source: OBS benchmark with LANCE_IO_THREADS=512
 - Key finding: 512 threads gave <1% improvement over 128 — bottleneck is not thread count
