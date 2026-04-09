@@ -8,24 +8,162 @@
 
 ## 1. Architecture
 
-### 1.1 Sharded Parallel Search (Plan B)
-
-Dataset is split into 5 shards (~194M rows each), queried in parallel via `ThreadPoolExecutor`, results merged client-side:
+### 1.1 Data Pipeline
 
 ```
-Query (512-dim vector)
-  ├→ Shard 0 (194M rows) → [IVF probe → distance → refine] → top-10K candidates ─┐
-  ├→ Shard 1              → [IVF probe → distance → refine] → top-10K candidates ─┤
-  ├→ Shard 2              → [IVF probe → distance → refine] → top-10K candidates ─┼→ Merge top-10K
-  ├→ Shard 3              → [IVF probe → distance → refine] → top-10K candidates ─┤
-  └→ Shard 4              → [IVF probe → distance → refine] → top-10K candidates ─┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          Data Preparation Pipeline                              │
+│                                                                                 │
+│  FineWeb-Edu ──┐                                                                │
+│  (324M rows)   │  replicate 3×  +  Gaussian noise (σ=0.01)  +  L2 normalize    │
+│  1024-dim      ├──────────────────────────────────────────────────────────┐      │
+│  float32       │                                                         │      │
+│                └─────────────────────┐                                   │      │
+│                                      ▼                                   ▼      │
+│                           ┌──────────────────┐                  ┌──────────────┐│
+│                           │   1B Baseline     │                  │   PCA-512    ││
+│                           │   972M × 1024-d   │    SVD(512)     │  972M × 512d ││
+│                           │                   │◄─────────────────│              ││
+│                           │   5 × 194M shards │                  │ 5 × 194M     ││
+│                           └────────┬─────────┘                  └──────┬───────┘│
+│                                    │                                   │        │
+│                         build_index │                     build_index  │        │
+│                           IVF_RQ    │                        ┌─────────┤        │
+│                           13,107 pt │                        │         │        │
+│                                    ▼                        ▼         ▼        │
+│                           ┌──────────────────┐    ┌──────────────┐ ┌─────────┐ │
+│                           │   IVF_RQ          │    │   IVF_RQ     │ │ IVF_SQ  │ │
+│                           │   5×386GB/shard   │    │   5×77GB/sh  │ │ 5×466GB │ │
+│                           │   RQ codes ~0.8GB │    │   RQ ~0.4GB  │ │ SQ~100GB│ │
+│                           │   + raw vectors   │    │   + raw vecs │ │ +raw vec│ │
+│                           └──────────────────┘    └──────────────┘ └─────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- 5 parallel workers (Lance releases GIL during Rust IO)
-- Merge: concatenate 5×10K results, sort by distance, take top-10K (~1ms)
-- Query: 5 timed queries after 3 warmup, seed=42
+### 1.2 Query Path (Plan B: Sharded Parallel)
 
-### 1.2 IVF Index Parameters
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                         Query Execution Flow                                   │
+│                                                                               │
+│  Query Vector ─────────┐                                                      │
+│  (512-dim, cosine)     │                                                      │
+│                        ▼                                                      │
+│              ┌──── ThreadPoolExecutor (5 workers) ────┐                        │
+│              │                                         │                        │
+│              │  ┌─────────┐  ┌─────────┐       ┌─────┐│                        │
+│              │  │ Worker0 │  │ Worker1 │  ...  │ W4  ││                        │
+│              │  └────┬────┘  └────┬────┘       └──┬──┘│                        │
+│              └───────┼────────────┼───────────────┼───┘                        │
+│                      ▼            ▼               ▼                            │
+│              ┌─────────────────────────────────────────┐                       │
+│              │         Per-Shard Search Pipeline        │                       │
+│              │                                           │                       │
+│              │  ┌─────────────┐    ┌──────────────────┐  │                       │
+│              │  │ 1. IVF Probe │    │  Storage Backend │  │                       │
+│              │  │  nprobe=N    │───►│  DRAM / SSD / S3 │  │                       │
+│              │  │  of 13,107   │    └──────────────────┘  │                       │
+│              │  └──────┬──────┘                          │                       │
+│              │         │ ~14,800 candidates/partition     │                       │
+│              │         ▼                                   │                       │
+│              │  ┌─────────────┐    ┌──────────────────┐  │                       │
+│              │  │ 2. Distance  │    │  RQ codes (0.8GB)│  │                       │
+│              │  │  Compute     │◄───│  or SQ codes(100G)│ │                       │
+│              │  │  approximate │    └──────────────────┘  │                       │
+│              │  └──────┬──────┘                          │                       │
+│              │         │ top-K×rf candidates              │                       │
+│              │         ▼                                   │                       │
+│              │  ┌─────────────┐    ┌──────────────────┐  │                       │
+│              │  │ 3. Refine    │    │  Original vectors│  │                       │
+│              │  │  (rf > 1)    │───►│  float32 (386GB) │  │                       │
+│              │  │  re-rank     │    │  skip if SQ rf=1 │  │                       │
+│              │  └──────┬──────┘    └──────────────────┘  │                       │
+│              │         │ top-K results per shard           │                       │
+│              └─────────┼──────────────────────────────────┘                       │
+│                        │                                                       │
+│                        ▼                                                       │
+│              ┌──────────────────┐                                               │
+│              │    Merge          │                                               │
+│              │    5×10K results  │                                               │
+│              │    sort by dist   │                                               │
+│              │    take top-10K   │                                               │
+│              │    (~1ms)         │                                               │
+│              └────────┬─────────┘                                               │
+│                       ▼                                                        │
+│               Final Top-10K                                                    │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 Index Internal Structure
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    IVF Index Layout (per shard, 194M rows)                   │
+│                                                                             │
+│  Centroid Index (IVF)                                                       │
+│  ┌─────────────────────────────────────┐                                    │
+│  │ 13,107 centroids (512-dim float32)  │  ← used to find top-nprobe        │
+│  │ ~26MB                               │    partitions per query            │
+│  └─────────────────────────────────────┘                                    │
+│          │                                                                  │
+│          │  partition assignment (Voronoi cell)                              │
+│          ▼                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    Partition (×13,107)                               │    │
+│  │  ~14,800 vectors each                                               │    │
+│  │                                                                     │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │    │
+│  │  │ IVF_RQ            │  │ IVF_RQ            │  │ IVF_SQ           │  │    │
+│  │  │                  │  │ (PCA-512)        │  │ (PCA-512)        │  │    │
+│  │  │ RQ codes:        │  │ RQ codes:        │  │ SQ codes:        │  │    │
+│  │  │ 4 levels × 1byte │  │ 4 levels × 1byte │  │ 512 bytes/vec    │  │    │
+│  │  │ = 4B / vector    │  │ = 4B / vector    │  │ = 512B / vector  │  │    │
+│  │  │                  │  │                  │  │                  │  │    │
+│  │  │ Total: ~0.8GB    │  │ Total: ~0.4GB    │  │ Total: ~100GB    │  │    │
+│  │  │                  │  │                  │  │                  │  │    │
+│  │  │ rf=1: 0.79 recall│  │ rf=1: 0.79 recall│  │ rf=1: 0.96 recall│  │    │
+│  │  │ rf=2: 0.98 recall│  │ rf=2: 0.95 recall│  │ rf=2: 0.97 recall│  │    │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│          │                                                                  │
+│          │  refine_factor > 1: read original vectors                        │
+│          ▼                                                                  │
+│  ┌─────────────────────────────────────┐                                    │
+│  │ Raw vectors (float32)               │  ← columnar storage (.lance)       │
+│  │ 1024-dim or 512-dim                 │    random access via take()        │
+│  │ ~386GB / shard (1024-dim)           │    IO bottleneck on OBS            │
+│  │ ~193GB / shard (512-dim)            │                                    │
+│  └─────────────────────────────────────┘                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.4 Storage Tier Latency Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Query Latency Breakdown                              │
+│                                                                         │
+│  DRAM (page cache hot)           SSD (cold cache)     OBS (S3)         │
+│  ┌────────────────────────┐      ┌─────────────────┐  ┌──────────────┐ │
+│  │████                    │      │██████            │  │██████████████│ │
+│  │████ CPU (rf)           │      │██████ CPU        │  │██████████████│ │
+│  │████ ~350ms/rf          │      │██████ ~350ms/rf  │  │██████████████│ │
+│  │████                    │      │██████            │  │████████████  │ │
+│  │████                    │      │██████ IO         │  │██████████████│ │
+│  │████ IO: ~50-200ms      │      │██████ ~100-500ms │  │██████████████│ │
+│  │████ (cache hit)        │      │██████ (NVMe)     │  │████████ S3   │ │
+│  │████                    │      │██████            │  │████████ 8-10s │ │
+│  │████                    │      │██████            │  │████████ /rf   │ │
+│  └────────────────────────┘      └─────────────────┘  └──────────────┘ │
+│                                                                         │
+│  Bottleneck: CPU (rf)            CPU (rf) + IO       IO (S3 RTT)        │
+│  rf unit cost: ~350ms            ~350ms + IO          ~8-10s /rf        │
+│  rf=1 → 0.5-1.7s                0.5-3.0s             8-23s             │
+│  rf=2 → 0.9-2.5s                0.9-3.3s             17-32s            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.5 IVF Index Parameters
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
@@ -34,15 +172,7 @@ Query (512-dim vector)
 | nprobe range | 128-1024 | 1-8% of partitions |
 | refine_factor | 1-5 | re-rank top-K×rf with original vectors |
 
-### 1.3 Storage Tiers
-
-| Tier | Setup | Notes |
-|------|-------|-------|
-| DRAM | page cache warm (read index files first) | 493GB RAM, index ~132-500GB |
-| SSD | `echo 3 > drop_caches` before each query | NVMe RAID0, 12TB |
-| OBS | Huawei S3, `LANCE_IO_THREADS=128` | ~100ms RTT per GET |
-
-### 1.4 Benchmark Tool
+### 1.6 Benchmark Tool
 
 ```
 benchmarks/cohere/bench.py query \
