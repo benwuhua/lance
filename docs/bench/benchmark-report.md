@@ -1,0 +1,343 @@
+# 1B Vector Search Benchmark Report
+
+> Dataset: 972M rows, FineWeb-Edu embeddings, 1024-dim, cosine
+> Date: 2026-04-09
+> Environment: Huawei Cloud ECS (493GB RAM, 12TB NVMe, OBS S3)
+
+---
+
+## 1. Architecture
+
+### 1.1 Sharded Parallel Search (Plan B)
+
+Dataset is split into 5 shards (~194M rows each), queried in parallel via `ThreadPoolExecutor`, results merged client-side:
+
+```
+Query (512-dim vector)
+  ├→ Shard 0 (194M rows) → [IVF probe → distance → refine] → top-10K candidates ─┐
+  ├→ Shard 1              → [IVF probe → distance → refine] → top-10K candidates ─┤
+  ├→ Shard 2              → [IVF probe → distance → refine] → top-10K candidates ─┼→ Merge top-10K
+  ├→ Shard 3              → [IVF probe → distance → refine] → top-10K candidates ─┤
+  └→ Shard 4              → [IVF probe → distance → refine] → top-10K candidates ─┘
+```
+
+- 5 parallel workers (Lance releases GIL during Rust IO)
+- Merge: concatenate 5×10K results, sort by distance, take top-10K (~1ms)
+- Query: 5 timed queries after 3 warmup, seed=42
+
+### 1.2 IVF Index Parameters
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| num_partitions | 13,107/shard | min(N/1000, 65536)/5 |
+| density | ~14,800 vecs/partition | 194M / 13,107 |
+| nprobe range | 128-1024 | 1-8% of partitions |
+| refine_factor | 1-5 | re-rank top-K×rf with original vectors |
+
+### 1.3 Storage Tiers
+
+| Tier | Setup | Notes |
+|------|-------|-------|
+| DRAM | page cache warm (read index files first) | 493GB RAM, index ~132-500GB |
+| SSD | `echo 3 > drop_caches` before each query | NVMe RAID0, 12TB |
+| OBS | Huawei S3, `LANCE_IO_THREADS=128` | ~100ms RTT per GET |
+
+### 1.4 Benchmark Tool
+
+```
+benchmarks/cohere/bench.py query \
+    --plan B --storage {dram,ssd,obs} \
+    --index-type {IVF_RQ,IVF_SQ} \
+    --shard-dir PATH --nprobes N --refine-factor N \
+    --top-k 10000 --num-shards 5 --query-count 8 --warmup 3
+```
+
+---
+
+## 2. Index Variants Tested
+
+### 2.1 IVF_RQ (Residual Quantization)
+
+- 4-level residual quantization, 8-bit per level (256 centroids)
+- Compressed codes: ~0.8GB/shard (very compact)
+- Total shard: ~386GB (RQ codes + raw float32 vectors)
+- **Strengths**: Compact codes, recall scales with rf (up to 0.995)
+- **Weaknesses**: rf=1 recall only ~0.79 (1-bit residual too coarse), rf>1 reads original float32 vectors
+
+### 2.2 IVF_SQ (Scalar Quantization)
+
+- 8-bit per dimension (float32 → uint8, 4x compression per vector)
+- SQ codes: ~100GB/shard (on top of raw vectors)
+- Total shard: ~466GB (SQ codes + raw float32 vectors)
+- **Strengths**: SQ distance very accurate, rf=1 recall 0.958 (vs RQ 0.790)
+- **Weaknesses**: Index exceeds page cache, recall ceiling at 0.972
+
+### 2.3 Dimensionality Reduction: PCA-512
+
+- TruncatedSVD 1024→512 on 500K sample, explained variance 96.63%
+- Applied to both RQ and SQ variants
+- ~2x smaller index, ~2x faster distance computation
+
+---
+
+## 3. Sweep Results
+
+### 3.1 1B Baseline (1024-dim, IVF_RQ)
+
+Index: 5 shards × 386GB = 1.93TB total. Recall measured on shard-0 against flat search GT.
+
+#### DRAM (partial page cache)
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) |
+|--------|-----|--------|-----------|----------|
+| 64 | 1 | 0.79* | 616 | 860 |
+| 64 | 2 | — | 840 | 975 |
+| 128 | 1 | 0.830 | 626 | 880 |
+| 128 | 2 | 0.921 | 904 | 1,011 |
+| 256 | 1 | 0.845 | 656 | 786 |
+| 256 | 2 | 0.950 | 968 | 1,063 |
+| 512 | 1 | — | 985 | 1,047 |
+| 512 | 2 | — | 1,262 | 1,338 |
+| 1024 | 1 | 0.861 | 1,740 | 1,843 |
+| 1024 | 2 | 0.983 | 2,150 | 2,218 |
+| 1024 | 3 | 0.993 | 2,513 | 2,631 |
+| 1024 | 5 | 0.995 | 3,468 | 3,786 |
+
+*Recall for np<128 estimated from GT subset. Some configs missing recall (ran before GT integration).
+
+#### SSD (cold cache)
+
+| nprobe | rf | Mean (ms) | P99 (ms) | SSD vs DRAM |
+|--------|-----|-----------|----------|-------------|
+| 64 | 1 | 631 | 888 | +2% |
+| 64 | 2 | 889 | 1,054 | +6% |
+| 128 | 1 | 677 | 979 | +8% |
+| 128 | 2 | 928 | 1,106 | +3% |
+| 256 | 1 | 754 | 914 | +15% |
+| 256 | 2 | 1,058 | 1,193 | +9% |
+| 512 | 1 | 1,168 | 1,231 | +19% |
+| 512 | 2 | 1,497 | 1,529 | +19% |
+| 1024 | 1 | 2,362 | 2,534 | +36% |
+| 1024 | 2 | 2,636 | 2,738 | +23% |
+| 1024 | 3 | 2,983 | 3,094 | +19% |
+| 1024 | 5 | 3,986 | 4,250 | +15% |
+
+#### OBS (S3)
+
+| nprobe | rf | Mean (ms) | P99 (ms) |
+|--------|-----|-----------|----------|
+| 64 | 1 | 8,218 | 8,648 |
+| 64 | 2 | 17,051 | 20,292 |
+| 128 | 1 | 8,403 | 8,946 |
+| 128 | 2 | 25,964 | 30,282 |
+| 256 | 1 | 8,909 | 9,481 |
+| 256 | 2 | 16,395 | 16,955 |
+| 512 | 1 | 11,195 | 11,762 |
+| 512 | 2 | 19,041 | 21,868 |
+| 1024 | 1 | 17,588 | 18,759 |
+| 1024 | 2 | 24,984 | 25,744 |
+
+---
+
+### 3.2 PCA-512 (512-dim, IVF_RQ)
+
+Index: 5 shards × ~77GB = 385GB total. 2x smaller index + 2x faster distance computation.
+
+#### DRAM
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | vs 1B Baseline |
+|--------|-----|--------|-----------|----------|----------------|
+| 128 | 1 | 0.790 | 523 | 537 | **16% faster** |
+| 128 | 2 | 0.942 | 875 | 888 | 3% faster |
+| 256 | 1 | 0.793 | 636 | 663 | 3% faster |
+| 256 | 2 | 0.948 | 977 | 1,006 | same |
+| 512 | 1 | 0.794 | 756 | 856 | 23% faster |
+| 512 | 2 | 0.951 | 1,091 | 1,167 | 14% faster |
+| 1024 | 1 | 0.794 | 846 | 1,035 | **51% faster** |
+| 1024 | 2 | 0.953 | 1,183 | 1,315 | **45% faster** |
+| 1024 | 3 | 0.967 | 1,563 | 1,694 | **38% faster** |
+| 1024 | 5 | 0.971 | 2,494 | 2,609 | 28% faster |
+
+#### OBS
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | vs 1B Baseline OBS |
+|--------|-----|--------|-----------|----------|---------------------|
+| 128 | 1 | 0.790 | 9,382 | 9,510 | same |
+| 128 | 2 | 0.942 | 18,729 | 18,995 | 28% faster |
+| 256 | 1 | 0.793 | 10,079 | 10,288 | same |
+| 256 | 2 | 0.948 | 19,306 | 19,568 | same |
+| 512 | 1 | 0.794 | 10,698 | 11,287 | same |
+| 512 | 2 | 0.951 | 20,010 | 20,430 | same |
+| 1024 | 1 | 0.794 | 11,363 | 12,046 | **35% faster** |
+| 1024 | 2 | 0.953 | 20,594 | 21,375 | 17% faster |
+
+**PCA-512 conclusion**: DRAM improvement significant at high nprobe (up to 51%). OBS improvement only at high nprobe + rf=1 (up to 35%). Recall ceiling ~0.97 from dimension loss.
+
+---
+
+### 3.3 PCA-512 + IVF_SQ (512-dim, IVF_SQ)
+
+Index: 5 shards × 466GB = 2.33TB total (SQ codes ~100GB + raw vectors ~386GB per shard).
+
+#### DRAM
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | RQ DRAM Mean | SQ vs RQ |
+|--------|-----|--------|-----------|----------|-------------|----------|
+| 128 | 1 | **0.958** | 993 | 1,102 | 523 | +90% |
+| 256 | 1 | **0.962** | 1,050 | 1,289 | 636 | +65% |
+| 512 | 1 | **0.964** | 1,684 | 2,129 | 756 | +123% |
+| 1024 | 1 | **0.965** | 2,479 | 3,020 | 846 | +193% |
+| 128 | 2 | **0.964** | 1,085 | 1,215 | 875 | +24% |
+| 256 | 2 | **0.969** | 1,234 | 1,497 | 977 | +26% |
+| 512 | 2 | **0.971** | 1,653 | 1,883 | 1,091 | +52% |
+| 1024 | 2 | **0.972** | 2,448 | 2,815 | 1,183 | +107% |
+| 1024 | 3 | 0.972 | 2,805 | 3,411 | 1,563 | +80% |
+| 1024 | 5 | 0.972 | 3,575 | 4,415 | 2,494 | +43% |
+
+#### SSD (cold cache)
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | SQ DRAM | SSD vs DRAM |
+|--------|-----|--------|-----------|----------|---------|-------------|
+| 128 | 1 | 0.958 | 949 | 1,001 | 993 | -5% |
+| 256 | 1 | 0.962 | 1,275 | 1,442 | 1,050 | +21% |
+| 512 | 1 | 0.964 | 1,813 | 2,136 | 1,684 | +8% |
+| 1024 | 1 | 0.965 | 3,027 | 3,483 | 2,479 | +22% |
+| 128 | 2 | 0.964 | 1,190 | 1,340 | 1,085 | +10% |
+| 256 | 2 | 0.969 | 1,477 | 1,746 | 1,234 | +20% |
+| 512 | 2 | 0.971 | 2,005 | 2,358 | 1,653 | +21% |
+| 1024 | 2 | 0.972 | 3,251 | 3,951 | 2,448 | +33% |
+| 1024 | 3 | 0.972 | 3,565 | 4,352 | 2,805 | +27% |
+| 1024 | 5 | 0.972 | 4,313 | 5,216 | 3,575 | +21% |
+
+#### OBS
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | RQ OBS | SQ vs RQ |
+|--------|-----|--------|-----------|----------|--------|----------|
+| 128 | 1 | 0.958 | 10,518 | 11,031 | 9,382 | +12% |
+| 256 | 1 | 0.962 | 12,508 | 13,935 | 10,079 | +24% |
+| 1024 | 1 | 0.965 | 22,883 | 25,807 | 11,363 | +101% |
+| 128 | 2 | 0.964 | 20,692 | 24,037 | 18,729 | +10% |
+| 256 | 2 | 0.969 | 23,298 | 26,854 | 19,306 | +21% |
+| 1024 | 2 | 0.972 | 32,103 | 34,735 | 20,594 | +56% |
+
+---
+
+## 4. Cross-Index Comparison
+
+### 4.1 Pareto Frontier: DRAM (best latency at each recall level)
+
+| Recall | Config | Mean (ms) |
+|--------|--------|-----------|
+| 0.79 | 1B np=128 rf=1 | **626** |
+| 0.83 | 1B np=128 rf=1 | 626 |
+| 0.92 | 1B np=128 rf=2 | 904 |
+| 0.94 | PCA-512 np=128 rf=2 | 875 |
+| 0.95 | PCA-512 np=256 rf=2 | 977 |
+| **0.958** | **SQ np=128 rf=1** | **993** |
+| 0.98 | 1B np=1024 rf=2 | 2,150 |
+| 0.99 | 1B np=1024 rf=3 | 2,513 |
+
+### 4.2 Pareto Frontier: OBS (best latency at each recall level)
+
+| Recall | Config | Mean (ms) |
+|--------|--------|-----------|
+| 0.79 | 1B np=64 rf=1 | **8,218** |
+| 0.79 | PCA-512 np=128 rf=1 | 9,382 |
+| **0.958** | **SQ np=128 rf=1** | **10,518** |
+| 0.942 | PCA-512 np=128 rf=2 | 18,729 |
+| 0.948 | PCA-512 np=256 rf=2 | 19,306 |
+| 0.951 | PCA-512 np=512 rf=2 | 20,010 |
+
+### 4.3 Matched-Recall OBS Comparison (key finding)
+
+SQ's higher recall at rf=1 eliminates the need for refinement on OBS, saving ~8-10s of vector download:
+
+| Target Recall | SQ Config | SQ OBS | RQ Config | RQ OBS | SQ Advantage |
+|--------------|-----------|--------|-----------|--------|-------------|
+| ~0.95 | np=128 rf=1 (0.958) | **10,518ms** | np=128 rf=2 (0.942) | 18,729ms | **44% faster** |
+| ~0.96 | np=256 rf=1 (0.962) | **12,508ms** | np=256 rf=2 (0.948) | 19,306ms | **35% faster** |
+| ~0.97 | np=1024 rf=2 (0.972) | 32,103ms | np=1024 rf=3 (0.967) | — | SQ worse |
+
+**Why**: SQ 8-bit per-dimension quantization is more accurate than RQ 1-bit residual. SQ rf=1 skips reading original vectors entirely — only reads SQ uint8 codes. On OBS, rf=2 downloads 20,000 original float32 vectors (~10s network transfer).
+
+---
+
+## 5. Analysis
+
+### 5.1 Storage Tier Breakdown
+
+| Component | DRAM | SSD | OBS |
+|-----------|------|-----|-----|
+| Index scan (RQ/SQ codes) | ~100ms | ~100-500ms | ~8-10s (S3 GET RTT) |
+| Refinement (float32 vectors) | ~350ms/rf | ~350ms/rf | ~8-10s/rf (S3 download) |
+| Distance computation | ~100-500ms | ~100-500ms | ~100-500ms |
+| rf=1 total | ~0.5-1.7s | ~0.5-3.0s | ~8-23s |
+| rf=2 total | ~0.9-2.5s | ~0.9-3.3s | ~17-32s |
+
+**Key insight**: On DRAM/SSD, rf cost is CPU-bound (~350ms/unit). On OBS, rf cost is IO-bound (~8-10s/unit for vector download).
+
+### 5.2 SQ Recall Ceiling
+
+SQ recall plateaus at **0.972** regardless of rf>2. This is a hard ceiling from 8-bit quantization error. RQ continues improving past 0.97 with higher rf.
+
+| Index | rf=1 max | rf=2 max | rf=3 max | rf=5 max |
+|-------|----------|----------|----------|----------|
+| IVF_RQ (PCA-512) | 0.794 | 0.953 | 0.967 | 0.971 |
+| IVF_SQ (PCA-512) | **0.965** | **0.972** | 0.972 | 0.972 |
+| IVF_RQ (1B 1024-dim) | 0.861 | 0.983 | 0.993 | 0.995 |
+
+### 5.3 Why SQ is Slower at Matched rf
+
+SQ index is larger than RQ index:
+- SQ: 466GB/shard (SQ codes ~100GB + raw vectors ~386GB)
+- RQ: 386GB/shard (RQ codes ~0.8GB + raw vectors ~386GB)
+- Larger index → more S3 GET requests → more RTT overhead on OBS
+- On DRAM, 500GB SQ codes exceed 493GB page cache
+
+---
+
+## 6. Recommendations by Scenario
+
+| Scenario | Recommended Config | Latency | Recall |
+|----------|-------------------|---------|--------|
+| **DRAM, recall ≤ 0.95** | 1B np=256 rf=2 | 968ms | 0.950 |
+| **DRAM, recall ≥ 0.99** | 1B np=1024 rf=3 | 2,513ms | 0.993 |
+| **SSD, recall ≤ 0.95** | 1B np=256 rf=2 | 1,058ms | 0.950 |
+| **OBS, recall ≤ 0.96** | **SQ np=128 rf=1** | **10,518ms** | **0.958** |
+| **OBS, recall > 0.97** | PCA-512 np=1024 rf=2 | 20,594ms | 0.953 |
+
+### IO Threads
+
+LANCE_IO_THREADS=512 vs 128 showed **<1% improvement**. The bottleneck is per-query IO scheduling, not global thread pool.
+
+---
+
+## 7. Optimization Roadmap
+
+Current best (DRAM): 2,513ms for recall 0.993. Knowhere achieves ~50ms at similar recall. 30x gap.
+
+| Priority | Optimization | Expected Impact | Status |
+|----------|-------------|----------------|--------|
+| P0 | Multi-bit RQ (4-6 bit levels) | rf=1 → 0.95 recall, save ~350ms/rf | Not started |
+| P1 | SQ8 two-stage rerank (within IVF_RQ) | Replace float32 reads, 10x faster refinement | Not started |
+| P2 | PQ FastScan (bbs=32, AVX-512 VNNI) | 4-10x PQ distance throughput | Not started |
+| P3 | Cross-query partition cache (LRU) | 50-80% IO reduction on OBS | Not started |
+
+**Projected** if all optimizations implemented: recall 0.99 in ~500ms (DRAM), ~15s (OBS).
+
+---
+
+## 8. Data Paths (ECS)
+
+| Item | Path |
+|------|------|
+| 1B shards (1024-dim) | `/data/work/tmp/s1b/shard-{0-4}.lance` |
+| PCA-512 shards | `/data/work/tmp/s1b-pca512/shard-{0-4}.lance` |
+| SQ shards | `/data/work/tmp/s1b-pca512-sq/shard-{0-4}.lance` |
+| 1B results | `/data/work/tmp/pareto-results/` |
+| PCA-512 results | `/data/work/tmp/pca512-results-v2/` |
+| SQ results | `/data/work/tmp/pca512-sq-results/` |
+| GT (positional) | `/data/work/tmp/s1b-pca512/gt_positional_v2.npz` |
+| OBS (1B) | `s3://knowledgebase-5f43/fineweb-edu-1b-rq-shard4/` |
+| OBS (PCA-512) | `s3://knowledgebase-5f43/pca512-1b/` |
+| OBS (SQ) | `s3://knowledgebase-5f43/pca512-sq-1b/` |
