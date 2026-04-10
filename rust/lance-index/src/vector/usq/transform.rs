@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow_array::{ArrayRef, Float32Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{ArrayRef, FixedSizeListArray, UInt8Array};
 use arrow_schema::Field;
 use lance_arrow::*;
 use lance_core::{Error, Result};
@@ -54,7 +54,7 @@ impl Transformer for USQTransformer {
             if field.name() == USQ_CODE_COLUMN
                 || field.name() == USQ_SIGN_COLUMN
                 || field.name() == USQ_META_COLUMN
-                || field.name() == vec_col_name
+                || field.name() == &vec_col_name
             {
                 continue;
             }
