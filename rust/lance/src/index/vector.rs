@@ -37,6 +37,8 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::{Shuffler, create_ivf_shuffler};
 use lance_index::vector::v3::subindex::SubIndexType;
+#[cfg(feature = "hanns")]
+use lance_index::vector::hanns::{HannsHnswIndex, hnsw_index::HannsHnswBuildParams};
 use lance_index::vector::{
     VectorIndex,
     hnsw::{
@@ -1241,6 +1243,99 @@ pub(crate) async fn build_vector_index_incremental(
                 }
             }
         }
+        // IVF_HANNS_HNSW variants
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, quantization_type) => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: Hanns HNSW index missing HNSW params in stages: {:?}",
+                    stages
+                )));
+            };
+            let hanns_build_params = HannsHnswBuildParams {
+                m: hnsw_params.max_level as usize,
+                ef_construction: hnsw_params.ef_construction,
+                ml: None,
+            };
+
+            match quantization_type {
+                QuantizationType::Flat => match element_type {
+                    DataType::UInt8 => {
+                        IvfIndexBuilder::<HannsHnswIndex, FlatBinQuantizer>::new_incremental(
+                            dataset.clone(),
+                            column.to_owned(),
+                            index_dir,
+                            params.metric_type,
+                            shuffler,
+                            hanns_build_params,
+                            frag_reuse_index,
+                            OptimizeOptions::append(),
+                        )?
+                        .with_ivf(ivf_model)
+                        .with_quantizer(quantizer.try_into()?)
+                        .with_progress(progress.clone())
+                        .build()
+                        .await?;
+                    }
+                    _ => {
+                        IvfIndexBuilder::<HannsHnswIndex, FlatQuantizer>::new_incremental(
+                            dataset.clone(),
+                            column.to_owned(),
+                            index_dir,
+                            params.metric_type,
+                            shuffler,
+                            hanns_build_params,
+                            frag_reuse_index,
+                            OptimizeOptions::append(),
+                        )?
+                        .with_ivf(ivf_model)
+                        .with_quantizer(quantizer.try_into()?)
+                        .with_progress(progress.clone())
+                        .build()
+                        .await?;
+                    }
+                },
+                QuantizationType::Product => {
+                    IvfIndexBuilder::<HannsHnswIndex, ProductQuantizer>::new_incremental(
+                        dataset.clone(),
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        shuffler,
+                        hanns_build_params,
+                        frag_reuse_index,
+                        OptimizeOptions::append(),
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+                QuantizationType::Scalar => {
+                    IvfIndexBuilder::<HannsHnswIndex, ScalarQuantizer>::new_incremental(
+                        dataset.clone(),
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        shuffler,
+                        hanns_build_params,
+                        frag_reuse_index,
+                        OptimizeOptions::append(),
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+                QuantizationType::Rabit => {
+                    return Err(Error::index(
+                        "Rabit quantization is not supported for Hanns HNSW index".to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1578,6 +1673,42 @@ pub async fn initialize_vector_index(
                 QuantizationType::Rabit => {
                     return Err(Error::index(
                         "Rabit quantization is not supported for HNSW index".to_string(),
+                    ));
+                }
+            }
+        }
+        // Hanns HNSW variants: reuse the same VectorIndexParams constructors,
+        // the HannsHnsw dispatch happens in build_vector_index_incremental.
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, quantization_type) => {
+            let hnsw_params = derive_hnsw_params(source_vector_index.as_ref());
+            match quantization_type {
+                QuantizationType::Flat => {
+                    VectorIndexParams::ivf_hnsw(metric_type, ivf_params, hnsw_params)
+                }
+                QuantizationType::Product => {
+                    let pq_quantizer: ProductQuantizer = quantizer.try_into()?;
+                    let pq_params = derive_pq_params(&pq_quantizer);
+                    VectorIndexParams::with_ivf_hnsw_pq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        pq_params,
+                    )
+                }
+                QuantizationType::Scalar => {
+                    let sq_quantizer: ScalarQuantizer = quantizer.try_into()?;
+                    let sq_params = derive_sq_params(&sq_quantizer);
+                    VectorIndexParams::with_ivf_hnsw_sq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        sq_params,
+                    )
+                }
+                QuantizationType::Rabit => {
+                    return Err(Error::index(
+                        "Rabit quantization is not supported for Hanns HNSW index".to_string(),
                     ));
                 }
             }

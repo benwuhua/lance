@@ -140,6 +140,7 @@ oss = ["lance-io/oss"]
 tencent = ["lance-io/tencent"]
 huggingface = ["lance-io/huggingface"]
 geo = ["dep:lance-geo", "lance-geo/geo", "lance-datafusion/geo", "lance-index/geo"]
+hanns = ["lance-index/hanns"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
 

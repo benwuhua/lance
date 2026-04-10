@@ -25,6 +25,8 @@ pub mod bq;
 pub mod distributed;
 pub mod flat;
 pub mod graph;
+#[cfg(feature = "hanns")]
+pub mod hanns;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;

@@ -12,6 +12,8 @@ use lance_core::{Error, Result};
 use crate::metrics::MetricsCollector;
 use crate::vector::storage::VectorStore;
 use crate::vector::{flat, hnsw};
+#[cfg(feature = "hanns")]
+use crate::vector::hanns;
 use crate::{prefilter::PreFilter, vector::Query};
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
@@ -62,6 +64,8 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 pub enum SubIndexType {
     Flat,
     Hnsw,
+    #[cfg(feature = "hanns")]
+    HannsHnsw,
 }
 
 impl std::fmt::Display for SubIndexType {
@@ -69,6 +73,8 @@ impl std::fmt::Display for SubIndexType {
         match self {
             Self::Flat => write!(f, "{}", flat::index::FlatIndex::name()),
             Self::Hnsw => write!(f, "{}", hnsw::builder::HNSW::name()),
+            #[cfg(feature = "hanns")]
+            Self::HannsHnsw => write!(f, "{}", hanns::HannsHnswIndex::name()),
         }
     }
 }
@@ -80,6 +86,8 @@ impl TryFrom<&str> for SubIndexType {
         match value {
             "FLAT" => Ok(Self::Flat),
             "HNSW" => Ok(Self::Hnsw),
+            #[cfg(feature = "hanns")]
+            "HANNS_HNSW" | "HANNS-HNSW" => Ok(Self::HannsHnsw),
             _ => Err(Error::index(format!("unknown sub index type {}", value))),
         }
     }

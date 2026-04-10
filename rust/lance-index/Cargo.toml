@@ -76,6 +76,7 @@ bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 rand_distr.workspace = true
 lance-datagen.workspace = true
 rangemap.workspace = true
+hanns = { path = "../../../../../Hanns", optional = true, default-features = false, features = ["parallel", "simd"] }
 
 [dev-dependencies]
 approx.workspace = true
@@ -94,6 +95,7 @@ geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-sch
 protoc = ["dep:protobuf-src"]
 tokenizer-lindera = ["dep:lindera", "dep:lindera-tantivy"]
 tokenizer-jieba = ["dep:jieba-rs"]
+hanns = ["dep:hanns"]
 
 [build-dependencies]
 prost-build.workspace = true
@@ -166,6 +168,14 @@ harness = false
 name = "geo"
 harness = false
 required-features = ["geo"]
+
+[[example]]
+name = "hanns_vs_lance"
+required-features = ["hanns"]
+
+[[example]]
+name = "hanns_vs_lance_1m"
+required-features = ["hanns"]
 
 [[bench]]
 name = "residual_transform"

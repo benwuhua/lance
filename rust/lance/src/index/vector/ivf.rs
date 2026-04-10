@@ -63,6 +63,8 @@ use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
+#[cfg(feature = "hanns")]
+use lance_index::vector::hanns::{HannsHnswIndex, hnsw_index::HannsHnswBuildParams};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
     optimize::OptimizeOptions,
@@ -566,6 +568,68 @@ pub(crate) async fn optimize_vector_indices_v2(
                 distance_type,
                 shuffler,
                 HnswBuildParams::default(),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(existing_indices.clone())
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?
+        }
+        // IVF_HANNS_HNSW_FLAT
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, QuantizationType::Flat) => {
+            if element_type == DataType::UInt8 {
+                IvfIndexBuilder::<HannsHnswIndex, FlatBinQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HannsHnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            } else {
+                IvfIndexBuilder::<HannsHnswIndex, FlatQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HannsHnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            }
+        }
+        // IVF_HANNS_HNSW_SQ
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<HannsHnswIndex, ScalarQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                HannsHnswBuildParams::default(),
                 frag_reuse_index,
                 options.clone(),
             )?
@@ -1615,6 +1679,48 @@ pub(crate) async fn remap_index_file_v3(
             )?
             .remap(mapping)
             .await
+        }
+        // IVF_HANNS_HNSW_FLAT
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, QuantizationType::Flat) => match element_type {
+            DataType::UInt8 => {
+                IvfIndexBuilder::<HannsHnswIndex, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+            _ => {
+                IvfIndexBuilder::<HannsHnswIndex, FlatQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?
+                .remap(mapping)
+                .await
+            }
+        },
+        // IVF_HANNS_HNSW_SQ
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<HannsHnswIndex, ScalarQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        // IVF_HANNS_HNSW_PQ
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, QuantizationType::Product) => {
+            IvfIndexBuilder::<HannsHnswIndex, ProductQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, QuantizationType::Rabit) => {
+            return Err(Error::index(
+                "Rabit quantization is not supported for Hanns HNSW index".to_string(),
+            ));
         }
     }
 }
