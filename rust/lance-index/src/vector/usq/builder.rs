@@ -35,8 +35,8 @@ fn encode_vector(
 ) -> EncodedVector {
     let encoded = quantizer.encode(vector);
     EncodedVector {
-        packed_bits: encoded.packed_bits.clone(),
-        sign_bits: encoded.sign_bits.clone(),
+        packed_bits: encoded.packed_bits,
+        sign_bits: encoded.sign_bits,
         norm: encoded.norm,
         norm_sq: encoded.norm_sq,
         vmax: encoded.vmax,

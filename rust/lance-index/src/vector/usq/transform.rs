@@ -29,32 +29,37 @@ impl USQTransformer {
 
 impl Transformer for USQTransformer {
     fn transform(&self, batch: &arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
-        let mut arrays: Vec<(String, ArrayRef)> = Vec::with_capacity(batch.num_columns() + 2);
-
-        // Keep existing columns
         let schema = batch.schema();
-        for i in 0..batch.num_columns() {
-            let field = schema.field(i);
-            if field.name() == USQ_CODE_COLUMN
-                || field.name() == USQ_SIGN_COLUMN
-                || field.name() == USQ_META_COLUMN
-            {
-                continue;
-            }
-            arrays.push((field.name().clone(), batch.column(i).clone()));
-        }
 
-        // Find the vectors column (last FixedSizeList<f32>)
-        let vectors_col = batch
+        // Find the vectors column (last FixedSizeList<f32>) — identify by index so we can drop it.
+        let (vec_col_idx, _) = batch
             .columns()
             .iter()
+            .enumerate()
             .rev()
-            .find(|col| {
+            .find(|(_, col)| {
                 col.as_fixed_size_list_opt().map_or(false, |fsl| {
                     matches!(fsl.value_type(), arrow_schema::DataType::Float32)
                 })
             })
             .ok_or_else(|| Error::index("USQ: no float32 vector column found"))?;
+        let vec_col_name = schema.field(vec_col_idx).name().clone();
+        let vectors_col = batch.column(vec_col_idx);
+
+        let mut arrays: Vec<(String, ArrayRef)> = Vec::with_capacity(batch.num_columns() + 2);
+
+        // Keep existing columns, dropping the input vector column and any stale USQ columns.
+        for i in 0..batch.num_columns() {
+            let field = schema.field(i);
+            if field.name() == USQ_CODE_COLUMN
+                || field.name() == USQ_SIGN_COLUMN
+                || field.name() == USQ_META_COLUMN
+                || field.name() == vec_col_name
+            {
+                continue;
+            }
+            arrays.push((field.name().clone(), batch.column(i).clone()));
+        }
 
         let fsl = vectors_col.as_fixed_size_list();
 
