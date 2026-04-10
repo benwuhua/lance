@@ -25,6 +25,8 @@ use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
 use crate::vector::bq::builder::RabitQuantizer;
+#[cfg(feature = "hanns")]
+use crate::vector::usq::builder::USQuantizer;
 use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 
 pub trait Quantization:
@@ -68,6 +70,7 @@ pub enum QuantizationType {
     Product,
     Scalar,
     Rabit,
+    Usq,
 }
 
 impl FromStr for QuantizationType {
@@ -79,6 +82,7 @@ impl FromStr for QuantizationType {
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
             "RABIT" => Ok(Self::Rabit),
+            "USQ" => Ok(Self::Usq),
             _ => Err(Error::index(format!("Unknown quantization type: {}", s))),
         }
     }
@@ -91,6 +95,7 @@ impl std::fmt::Display for QuantizationType {
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
             Self::Rabit => write!(f, "RQ"),
+            Self::Usq => write!(f, "USQ"),
         }
     }
 }
@@ -120,6 +125,8 @@ pub enum Quantizer {
     Product(ProductQuantizer),
     Scalar(ScalarQuantizer),
     Rabit(RabitQuantizer),
+    #[cfg(feature = "hanns")]
+    Usq(USQuantizer),
 }
 
 impl Quantizer {
@@ -130,6 +137,8 @@ impl Quantizer {
             Self::Product(pq) => pq.code_dim(),
             Self::Scalar(sq) => sq.code_dim(),
             Self::Rabit(rq) => rq.code_dim(),
+            #[cfg(feature = "hanns")]
+            Self::Usq(q) => q.code_dim(),
         }
     }
 
@@ -140,6 +149,8 @@ impl Quantizer {
             Self::Product(pq) => pq.column(),
             Self::Scalar(sq) => sq.column(),
             Self::Rabit(rq) => rq.column(),
+            #[cfg(feature = "hanns")]
+            Self::Usq(q) => q.column(),
         }
     }
 
@@ -150,6 +161,8 @@ impl Quantizer {
             Self::Product(_) => ProductQuantizer::metadata_key(),
             Self::Scalar(_) => ScalarQuantizer::metadata_key(),
             Self::Rabit(_) => RabitQuantizer::metadata_key(),
+            #[cfg(feature = "hanns")]
+            Self::Usq(_) => USQuantizer::metadata_key(),
         }
     }
 
@@ -160,6 +173,8 @@ impl Quantizer {
             Self::Product(_) => QuantizationType::Product,
             Self::Scalar(_) => QuantizationType::Scalar,
             Self::Rabit(_) => QuantizationType::Rabit,
+            #[cfg(feature = "hanns")]
+            Self::Usq(_) => QuantizationType::Usq,
         }
     }
 
@@ -170,6 +185,8 @@ impl Quantizer {
             Self::Product(pq) => serde_json::to_value(pq.metadata(args))?,
             Self::Scalar(sq) => serde_json::to_value(sq.metadata(args))?,
             Self::Rabit(rq) => serde_json::to_value(rq.metadata(args))?,
+            #[cfg(feature = "hanns")]
+            Self::Usq(q) => serde_json::to_value(q.metadata(args))?,
         };
         Ok(metadata)
     }

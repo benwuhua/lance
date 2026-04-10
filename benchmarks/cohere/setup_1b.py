@@ -150,14 +150,15 @@ def build_index(
     column: str,
     metric: str,
     num_partitions: int,
+    index_type: str = "IVF_RQ",
 ) -> None:
-    """Build IVF_RQ index on a shard."""
+    """Build vector index on a shard."""
     ds = lance.dataset(shard_uri)
-    print(f"  Building IVF_RQ index (partitions={num_partitions})...", flush=True)
+    print(f"  Building {index_type} index (partitions={num_partitions})...", flush=True)
     t0 = time.perf_counter()
     ds.create_index(
         column=column,
-        index_type="IVF_RQ",
+        index_type=index_type,
         metric=metric,
         num_partitions=num_partitions,
     )

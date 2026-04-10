@@ -362,6 +362,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
             (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
+            #[cfg(feature = "hanns")]
+            (SubIndexType::Flat, QuantizationType::Usq) => IndexType::IvfUsq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat) => IndexType::IvfHnswFlat,

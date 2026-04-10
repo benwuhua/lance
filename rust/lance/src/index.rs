@@ -1642,6 +1642,20 @@ impl DatasetIndexInternalExt for Dataset {
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
+                    #[cfg(feature = "hanns")]
+                    "IVF_USQ" => {
+                        let ivf = IVFIndex::<FlatIndex, lance_index::vector::usq::builder::USQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
 
                     "IVF_HNSW_FLAT" => {
                         let uri = index_dir.child(uuid).child("index.pb");

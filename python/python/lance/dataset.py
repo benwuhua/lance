@@ -2891,6 +2891,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
             "IVF_RQ",
+            "IVF_USQ",
         ]
         if index_type not in valid_index_types:
             raise NotImplementedError(

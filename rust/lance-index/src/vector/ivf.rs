@@ -86,6 +86,14 @@ pub fn new_ivf_transformer_with_quantizer(
             rq,
             range,
         )),
+        #[cfg(feature = "hanns")]
+        Quantizer::Usq(usq) => Ok(IvfTransformer::with_usq(
+            centroids,
+            metric_type,
+            vector_column,
+            usq,
+            range,
+        )),
     }
 }
 
@@ -323,6 +331,53 @@ impl IvfTransformer {
             centroids.clone(),
             vector_column,
         )));
+
+        Self::new(centroids, distance_type, transforms)
+    }
+
+    #[cfg(feature = "hanns")]
+    fn with_usq(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        usq: crate::vector::usq::builder::USQuantizer,
+        range: Option<Range<u32>>,
+    ) -> Self {
+        let mut transforms: Vec<Arc<dyn Transformer>> =
+            vec![Arc::new(super::transform::Flatten::new(vector_column))];
+
+        let distance_type = if distance_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            distance_type
+        };
+        transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
+
+        let partition_transform = Arc::new(
+            PartitionTransformer::new(centroids.clone(), distance_type, vector_column)
+                .with_distance(true),
+        );
+        transforms.push(partition_transform);
+
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        transforms.push(Arc::new(ResidualTransform::new(
+            centroids.clone(),
+            PART_ID_COLUMN,
+            vector_column,
+        )));
+
+        transforms.push(Arc::new(
+            crate::vector::usq::transform::USQTransformer::new(usq),
+        ));
 
         Self::new(centroids, distance_type, transforms)
     }

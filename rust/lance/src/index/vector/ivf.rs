@@ -499,6 +499,26 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?
         }
+        #[cfg(feature = "hanns")]
+        (SubIndexType::Flat, QuantizationType::Usq) => {
+            IvfIndexBuilder::<FlatIndex, lance_index::vector::usq::builder::USQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(existing_indices.clone())
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?
+        }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
             if element_type == DataType::UInt8 {
@@ -1642,6 +1662,14 @@ pub(crate) async fn remap_index_file_v3(
             .remap(mapping)
             .await
         }
+        #[cfg(feature = "hanns")]
+        (SubIndexType::Flat, QuantizationType::Usq) => {
+            IvfIndexBuilder::<FlatIndex, lance_index::vector::usq::builder::USQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
         (SubIndexType::Hnsw, QuantizationType::Flat) => match element_type {
             DataType::UInt8 => {
                 IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
@@ -1679,6 +1707,12 @@ pub(crate) async fn remap_index_file_v3(
             )?
             .remap(mapping)
             .await
+        }
+        #[cfg(feature = "hanns")]
+        (SubIndexType::Hnsw, QuantizationType::Usq) => {
+            return Err(Error::index(
+                "USQ quantization is not supported for HNSW index".to_string(),
+            ));
         }
         // IVF_HANNS_HNSW_FLAT
         #[cfg(feature = "hanns")]
@@ -1720,6 +1754,12 @@ pub(crate) async fn remap_index_file_v3(
         (SubIndexType::HannsHnsw, QuantizationType::Rabit) => {
             return Err(Error::index(
                 "Rabit quantization is not supported for Hanns HNSW index".to_string(),
+            ));
+        }
+        #[cfg(feature = "hanns")]
+        (SubIndexType::HannsHnsw, QuantizationType::Usq) => {
+            return Err(Error::index(
+                "USQ quantization is not supported for Hanns HNSW index".to_string(),
             ));
         }
     }

@@ -18,6 +18,8 @@ use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
+#[cfg(feature = "hanns")]
+use lance_index::vector::usq::USQBuildParams;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -1911,7 +1913,7 @@ impl Dataset {
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
+            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_USQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -3311,6 +3313,8 @@ fn prepare_vector_index_params(
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
     let mut rq_params = RQBuildParams::default();
+    #[cfg(feature = "hanns")]
+    let mut usq_params = USQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
     let mut skip_transpose = false;
 
@@ -3420,6 +3424,10 @@ fn prepare_vector_index_params(
             let num_bits: u8 = n.extract()?;
             pq_params.num_bits = num_bits as usize;
             rq_params.num_bits = num_bits;
+            #[cfg(feature = "hanns")]
+            {
+                usq_params.num_bits = num_bits;
+            }
         };
 
         if let Some(n) = kwargs.get_item("num_sub_vectors")? {
@@ -3464,6 +3472,15 @@ fn prepare_vector_index_params(
         "IVF_RQ" => Ok(Box::new(VectorIndexParams::with_ivf_rq_params(
             m_type, ivf_params, rq_params,
         ))),
+
+        #[cfg(feature = "hanns")]
+        "IVF_USQ" => Ok(Box::new(VectorIndexParams::with_ivf_usq_params(
+            m_type, ivf_params, usq_params,
+        ))),
+        #[cfg(not(feature = "hanns"))]
+        "IVF_USQ" => Err(PyValueError::new_err(
+            "IVF_USQ index type requires the 'hanns' feature to be enabled.".to_string(),
+        )),
 
         "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
             m_type,

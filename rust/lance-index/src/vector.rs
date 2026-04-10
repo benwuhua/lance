@@ -28,6 +28,8 @@ pub mod graph;
 #[cfg(feature = "hanns")]
 pub mod hanns;
 pub mod hnsw;
+#[cfg(feature = "hanns")]
+pub mod usq;
 pub mod ivf;
 pub mod kmeans;
 pub mod pq;

@@ -1048,7 +1048,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let is_pq = Q::quantization_type() == QuantizationType::Product;
-        let is_rq = Q::quantization_type() == QuantizationType::Rabit;
+        let is_rq = Q::quantization_type() == QuantizationType::Rabit
+            || cfg!(feature = "hanns") && Q::quantization_type() == QuantizationType::Usq;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1213,6 +1214,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let quant_type = Q::quantization_type();
         let transposed = match quant_type {
             QuantizationType::Product | QuantizationType::Rabit => self.transpose_codes,
+            #[cfg(feature = "hanns")]
+            QuantizationType::Usq => false,
             _ => false,
         };
         // For now, each partition's metadata is just the quantizer,

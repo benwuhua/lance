@@ -73,6 +73,8 @@ pub enum StageParams {
     PQ(PQBuildParams),
     SQ(SQBuildParams),
     RQ(RQBuildParams),
+    #[cfg(feature = "hanns")]
+    USQ(lance_index::vector::usq::USQBuildParams),
 }
 
 // The version of the index file.
@@ -247,6 +249,21 @@ impl VectorIndexParams {
         }
     }
 
+    #[cfg(feature = "hanns")]
+    pub fn with_ivf_usq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        usq: lance_index::vector::usq::USQBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::USQ(usq)];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+            skip_transpose: false,
+        }
+    }
+
     pub fn ivf_hnsw(
         distance_type: DistanceType,
         ivf: IvfBuildParams,
@@ -311,6 +328,8 @@ impl VectorIndexParams {
             (2, _, Some(StageParams::PQ(_))) => IndexType::IvfPq,
             (2, _, Some(StageParams::SQ(_))) => IndexType::IvfSq,
             (2, _, Some(StageParams::RQ(_))) => IndexType::IvfRq,
+            #[cfg(feature = "hanns")]
+            (2, _, Some(StageParams::USQ(_))) => IndexType::IvfUsq,
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
@@ -1156,6 +1175,27 @@ pub(crate) async fn build_vector_index_incremental(
                 .build()
                 .await?;
         }
+        // IVF_USQ
+        #[cfg(feature = "hanns")]
+        (SubIndexType::Flat, QuantizationType::Usq) => {
+            let mut builder = IvfIndexBuilder::<FlatIndex, lance_index::vector::usq::builder::USQuantizer>::new_incremental(
+                dataset.clone(),
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                OptimizeOptions::append(),
+            )?;
+            builder
+                .with_ivf(ivf_model)
+                .with_quantizer(quantizer.try_into()?)
+                .with_transpose(!params.skip_transpose)
+                .with_progress(progress.clone())
+                .build()
+                .await?;
+        }
         // IVF_HNSW variants
         (SubIndexType::Hnsw, quantization_type) => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1239,6 +1279,12 @@ pub(crate) async fn build_vector_index_incremental(
                 QuantizationType::Rabit => {
                     return Err(Error::index(
                         "Rabit quantization is not supported for HNSW index".to_string(),
+                    ));
+                }
+                #[cfg(feature = "hanns")]
+                QuantizationType::Usq => {
+                    return Err(Error::index(
+                        "USQ quantization is not supported for HNSW index".to_string(),
                     ));
                 }
             }
@@ -1332,6 +1378,12 @@ pub(crate) async fn build_vector_index_incremental(
                 QuantizationType::Rabit => {
                     return Err(Error::index(
                         "Rabit quantization is not supported for Hanns HNSW index".to_string(),
+                    ));
+                }
+                #[cfg(feature = "hanns")]
+                QuantizationType::Usq => {
+                    return Err(Error::index(
+                        "USQ quantization is not supported for Hanns HNSW index".to_string(),
                     ));
                 }
             }
@@ -1644,6 +1696,12 @@ pub async fn initialize_vector_index(
             let rabit_params = derive_rabit_params(&rabit_quantizer);
             VectorIndexParams::with_ivf_rq_params(metric_type, ivf_params, rabit_params)
         }
+        #[cfg(feature = "hanns")]
+        (SubIndexType::Flat, QuantizationType::Usq) => {
+            let usq_quantizer: lance_index::vector::usq::builder::USQuantizer = quantizer.try_into()?;
+            let usq_params = lance_index::vector::usq::USQBuildParams::new(usq_quantizer.num_bits());
+            VectorIndexParams::with_ivf_usq_params(metric_type, ivf_params, usq_params)
+        }
         (SubIndexType::Hnsw, quantization_type) => {
             let hnsw_params = derive_hnsw_params(source_vector_index.as_ref());
             match quantization_type {
@@ -1673,6 +1731,12 @@ pub async fn initialize_vector_index(
                 QuantizationType::Rabit => {
                     return Err(Error::index(
                         "Rabit quantization is not supported for HNSW index".to_string(),
+                    ));
+                }
+                #[cfg(feature = "hanns")]
+                QuantizationType::Usq => {
+                    return Err(Error::index(
+                        "USQ quantization is not supported for HNSW index".to_string(),
                     ));
                 }
             }
@@ -1709,6 +1773,11 @@ pub async fn initialize_vector_index(
                 QuantizationType::Rabit => {
                     return Err(Error::index(
                         "Rabit quantization is not supported for Hanns HNSW index".to_string(),
+                    ));
+                }
+                QuantizationType::Usq => {
+                    return Err(Error::index(
+                        "USQ quantization is not supported for Hanns HNSW index".to_string(),
                     ));
                 }
             }
