@@ -2,18 +2,47 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt8Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 use arrow_schema::{DataType, Field};
 use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use rayon::prelude::*;
 
-use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
+use crate::vector::quantizer::{Quantization, Quantizer};
 use crate::vector::usq::storage::{USQStorage, UsqQuantizationMetadata};
 use crate::vector::usq::{USQBuildParams, USQ_CODE_COLUMN, USQ_META_COLUMN, USQ_METADATA_KEY, USQ_SIGN_COLUMN};
+
+#[cfg(test)]
+static HANNS_QUANTIZER_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn new_hanns_quantizer(
+    config: hanns::quantization::usq::UsqConfig,
+) -> hanns::quantization::usq::UsqQuantizer {
+    #[cfg(test)]
+    HANNS_QUANTIZER_INIT_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    hanns::quantization::usq::UsqQuantizer::new(config)
+}
+
+fn encode_vector(
+    quantizer: &hanns::quantization::usq::UsqQuantizer,
+    vector: &[f32],
+) -> EncodedVector {
+    let encoded = quantizer.encode(vector);
+    EncodedVector {
+        packed_bits: encoded.packed_bits.clone(),
+        sign_bits: encoded.sign_bits.clone(),
+        norm: encoded.norm,
+        norm_sq: encoded.norm_sq,
+        vmax: encoded.vmax,
+        quant_quality: encoded.quant_quality,
+    }
+}
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct USQuantizer {
@@ -54,7 +83,7 @@ impl USQuantizer {
         self.padded_dim() / 8
     }
 
-    pub fn transform(&self, vectors: &FixedSizeListArray) -> Result<EncodedBatch> {
+    pub(crate) fn transform(&self, vectors: &FixedSizeListArray) -> Result<EncodedBatch> {
         let n = vectors.len();
         let dim = vectors.value_length() as usize;
         let values = vectors.values().as_primitive::<arrow::datatypes::Float32Type>();
@@ -78,18 +107,10 @@ impl USQuantizer {
         let results: Vec<Result<EncodedVector>> = values
             .values()
             .par_chunks_exact(dim)
-            .map(|vector| {
-                let quantizer = hanns::quantization::usq::UsqQuantizer::new(usq_config.clone());
-                let encoded = quantizer.encode(vector);
-                Ok(EncodedVector {
-                    packed_bits: encoded.packed_bits.clone(),
-                    sign_bits: encoded.sign_bits.clone(),
-                    norm: encoded.norm,
-                    norm_sq: encoded.norm_sq,
-                    vmax: encoded.vmax,
-                    quant_quality: encoded.quant_quality,
-                })
-            })
+            .map_init(
+                || new_hanns_quantizer(usq_config.clone()),
+                |quantizer, vector| Ok(encode_vector(quantizer, vector)),
+            )
             .collect();
 
         for (i, result) in results.into_iter().enumerate() {
@@ -175,7 +196,6 @@ impl Quantization for USQuantizer {
 
         let batch = self.transform(fsl)?;
         let code_bytes = self.code_bytes();
-        let n = fsl.len();
 
         let codes = UInt8Array::from(batch.packed_bits);
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
@@ -263,5 +283,40 @@ impl TryFrom<Quantizer> for USQuantizer {
 impl From<USQuantizer> for Quantizer {
     fn from(q: USQuantizer) -> Self {
         Self::Usq(q)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use rayon::ThreadPoolBuilder;
+
+    #[test]
+    fn transform_reuses_quantizer_initialization_across_vectors() {
+        const DIM: usize = 8;
+        const NUM_VECTORS: usize = 32;
+
+        let values = Float32Array::from(
+            (0..DIM * NUM_VECTORS)
+                .map(|idx| (idx % 13) as f32 * 0.25 + 0.1)
+                .collect::<Vec<_>>(),
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let quantizer = USQuantizer::new(DIM, 4, 42);
+
+        HANNS_QUANTIZER_INIT_COUNT.store(0, Ordering::Relaxed);
+
+        let pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let batch = pool.install(|| quantizer.transform(&vectors)).unwrap();
+
+        assert_eq!(batch.norms.len(), NUM_VECTORS);
+        assert_eq!(batch.packed_bits.len(), NUM_VECTORS * quantizer.code_bytes());
+
+        let init_count = HANNS_QUANTIZER_INIT_COUNT.swap(0, Ordering::Relaxed);
+        assert!(
+            init_count < NUM_VECTORS,
+            "expected quantizer initialization count to be less than vector count, got {init_count} for {NUM_VECTORS} vectors"
+        );
     }
 }
