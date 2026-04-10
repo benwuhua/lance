@@ -897,6 +897,32 @@ pub(crate) async fn build_vector_index(
                 .build()
                 .await?;
         }
+        #[cfg(feature = "hanns")]
+        IndexType::IvfUsq => {
+            let StageParams::USQ(usq_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+
+            let mut builder = IvfIndexBuilder::<FlatIndex, lance_index::vector::usq::builder::USQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                shuffler,
+                Some(ivf_params),
+                Some(usq_params.clone()),
+                (),
+                frag_reuse_index,
+            )?;
+
+            builder
+                .with_progress(progress.clone())
+                .build()
+                .await?;
+        }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
                 return Err(Error::index(format!(

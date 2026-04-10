@@ -70,6 +70,7 @@ pub enum QuantizationType {
     Product,
     Scalar,
     Rabit,
+    #[cfg(feature = "hanns")]
     Usq,
 }
 
@@ -82,6 +83,7 @@ impl FromStr for QuantizationType {
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
             "RABIT" => Ok(Self::Rabit),
+            #[cfg(feature = "hanns")]
             "USQ" => Ok(Self::Usq),
             _ => Err(Error::index(format!("Unknown quantization type: {}", s))),
         }
@@ -95,6 +97,7 @@ impl std::fmt::Display for QuantizationType {
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
             Self::Rabit => write!(f, "RQ"),
+            #[cfg(feature = "hanns")]
             Self::Usq => write!(f, "USQ"),
         }
     }

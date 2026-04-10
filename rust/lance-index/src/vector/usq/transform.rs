@@ -32,8 +32,9 @@ impl Transformer for USQTransformer {
         let mut arrays: Vec<(String, ArrayRef)> = Vec::with_capacity(batch.num_columns() + 2);
 
         // Keep existing columns
+        let schema = batch.schema();
         for i in 0..batch.num_columns() {
-            let field = batch.schema().field(i);
+            let field = schema.field(i);
             if field.name() == USQ_CODE_COLUMN
                 || field.name() == USQ_SIGN_COLUMN
                 || field.name() == USQ_META_COLUMN

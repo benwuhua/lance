@@ -197,9 +197,8 @@ impl VectorStore for USQStorage {
     }
 
     fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
-        let query_fsl = query.as_fixed_size_list();
-        let query_vals = query_fsl
-            .values()
+        // Query is always a flat Float32Array, not FixedSizeListArray (see IVF search pipeline).
+        let query_vals = query
             .as_primitive::<arrow::datatypes::Float32Type>()
             .values();
 
