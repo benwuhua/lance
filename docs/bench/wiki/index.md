@@ -38,6 +38,9 @@ TruncatedSVD 1024→512 dim reduction. Recall ceiling ~0.97, DRAM 10% faster at 
 ### [PCA-512 + IVF_SQ](experiments/pca512-sq.md)
 IVF_SQ on PCA-512. At matched recall, SQ rf=1 is **35-44% faster than RQ rf=2 on OBS** (0.958 vs 0.942 recall). SQ 8-bit quantization accurate enough to skip refinement. Best for OBS with recall ≤ 0.96.
 
+### [PCA-512 + IVF_USQ](experiments/pca512-usq.md)
+IVF_USQ (4-bit Hanns) on PCA-512. Same recall as RQ, 2-6% faster at low nprobe but 7-31% slower at high nprobe due to 63GB/shard index causing cache pollution. Not a clear win over RQ for DRAM/SSD.
+
 ### [Exact Rerank](experiments/exact-rerank.md) (Abandoned)
 Post-merge exact rerank via take(). Abandoned: random access to columnar storage 5x slower than built-in refinement.
 

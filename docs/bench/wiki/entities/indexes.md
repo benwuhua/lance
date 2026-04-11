@@ -59,3 +59,29 @@ See [metrics](../concepts/metrics.md) for recall measurement methodology.
 | PCA-512 | 512 | 13,107 | ~66GB | 194M |
 | PCA-512 + SQ | 512 | 13,107 | ~100GB/shard (SQ codes) + 386GB/shard (vectors) | 194M |
 | 324M | 1024 | 1,125 | ~44GB | 81M |
+
+## IVF_USQ (Experimental)
+
+**Ultra-Sparse Quantization** — 4-bit quantization via Hanns library.
+
+### What it is
+- Same IVF partitioning as RQ
+- USQ applies random rotation → normalize → 4-bit quantize
+- Uses Hanns approximate scoring for distance computation
+- Gated behind `#[cfg(feature = "hanns")]`
+
+### Our Configuration
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| num_partitions | 13,107/shard | Same as RQ/SQ for fair comparison |
+| metric | cosine | Same data |
+| num_bits | 4 | USQ default (half of SQ's 8-bit) |
+| code size | ~336B/vector | 256B packed + 64B signs + 16B meta |
+
+### Key Properties
+- **Build time**: ~20 min/shard (194M × 512-dim)
+- **Recall ceiling**: ~0.97 (same as RQ)
+- **Speed**: 2-6% faster than RQ at np<=256, 7-31% slower at np>=1024 (cache pollution from 63GB/shard index)
+- **Trade-off**: Lower per-vector accuracy (4-bit) but much faster distance computation
+
