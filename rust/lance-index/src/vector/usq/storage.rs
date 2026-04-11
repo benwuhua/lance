@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::AsArray;
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
@@ -54,7 +54,7 @@ impl QuantizerMetadata for UsqQuantizationMetadata {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct USQStorage {
     metadata: UsqQuantizationMetadata,
     batch: RecordBatch,
@@ -65,6 +65,26 @@ pub struct USQStorage {
     codes: FixedSizeListArray,
     signs: FixedSizeListArray,
     meta: FixedSizeListArray,
+
+    /// Cached quantizer — QR decomposition (O(d³)) runs once per partition load,
+    /// not once per query call to dist_calculator().
+    cached_quantizer: OnceLock<hanns::quantization::usq::UsqQuantizer>,
+}
+
+impl Clone for USQStorage {
+    fn clone(&self) -> Self {
+        Self {
+            metadata: self.metadata.clone(),
+            batch: self.batch.clone(),
+            distance_type: self.distance_type,
+            row_ids: self.row_ids.clone(),
+            codes: self.codes.clone(),
+            signs: self.signs.clone(),
+            meta: self.meta.clone(),
+            // Clone starts with empty lock; quantizer will be re-initialized on first use.
+            cached_quantizer: OnceLock::new(),
+        }
+    }
 }
 
 impl DeepSizeOf for USQStorage {
@@ -98,6 +118,7 @@ impl QuantizerStorage for USQStorage {
             codes,
             signs,
             meta,
+            cached_quantizer: OnceLock::new(),
         })
     }
 
@@ -122,7 +143,7 @@ impl QuantizerStorage for USQStorage {
 pub struct USQDistCalculator<'a> {
     query_norm_sq: f32,
     query_state: hanns::quantization::usq::UsqQueryState,
-    quantizer: hanns::quantization::usq::UsqQuantizer,
+    quantizer: &'a hanns::quantization::usq::UsqQuantizer,
     codes: &'a [u8],
     code_bytes: usize,
     meta: &'a FixedSizeListArray,
@@ -202,14 +223,18 @@ impl VectorStore for USQStorage {
             .as_primitive::<arrow::datatypes::Float32Type>()
             .values();
 
-        let usq_config =
-            hanns::quantization::usq::UsqConfig::new(
-                self.metadata.dim as usize,
-                self.metadata.num_bits,
-            )
-            .expect("USQ config creation failed")
-            .with_seed(self.metadata.rotation_seed);
-        let quantizer = hanns::quantization::usq::UsqQuantizer::new(usq_config);
+        // Get (or lazily init) the partition-level quantizer — QR runs at most once
+        // per USQStorage lifetime, not once per query.
+        let quantizer = self.cached_quantizer.get_or_init(|| {
+            let usq_config =
+                hanns::quantization::usq::UsqConfig::new(
+                    self.metadata.dim as usize,
+                    self.metadata.num_bits,
+                )
+                .expect("USQ config creation failed")
+                .with_seed(self.metadata.rotation_seed);
+            hanns::quantization::usq::UsqQuantizer::new(usq_config)
+        });
         let query_state = quantizer.precompute_query_state(query_vals);
         let query_norm_sq: f32 = query_vals.iter().map(|v| v * v).sum();
 
