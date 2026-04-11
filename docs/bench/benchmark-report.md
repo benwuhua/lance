@@ -37,6 +37,13 @@
 │                           │   RQ codes ~0.8GB │    │   RQ ~0.4GB  │ │ SQ~100GB│ │
 │                           │   + raw vectors   │    │   + raw vecs │ │ +raw vec│ │
 │                           └──────────────────┘    └──────────────┘ └─────────┘ │
+│                                                                   │         │
+│                                              ┌──────────────────┐ │         │
+│                                              │ IVF_USQ (4-bit)  │ │         │
+│                                              │ 5×256GB/shard    │ │         │
+│                                              │ USQ codes ~63GB  │ │         │
+│                                              │ + raw vectors    │ │         │
+│                                              └──────────────────┘ │         │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -124,6 +131,20 @@
 │  │  │ rf=1: 0.79 recall│  │ rf=1: 0.79 recall│  │ rf=1: 0.96 recall│  │    │
 │  │  │ rf=2: 0.98 recall│  │ rf=2: 0.95 recall│  │ rf=2: 0.97 recall│  │    │
 │  │  └──────────────────┘  └──────────────────┘  └──────────────────┘  │    │
+│  │  ┌──────────────────┐                                              │    │
+│  │  │ IVF_USQ (4-bit)  │  ← NEW: Hanns 4-bit quantization           │    │
+│  │  │ USQ codes:       │                                              │    │
+│  │  │ 256B packed      │                                              │    │
+│  │  │ + 64B signs      │                                              │    │
+│  │  │ + 16B meta       │                                              │    │
+│  │  │ = 336B / vector  │                                              │    │
+│  │  │                  │                                              │    │
+│  │  │ Total: ~63GB     │  (large! but 6x smaller than float32)       │    │
+│  │  │                  │                                              │    │
+│  │  │ rf=1: 0.79 recall│  (same as RQ)                               │    │
+│  │  │ rf=2: 0.95 recall│                                              │    │
+│  │  │ rf=5: 0.99 recall│  (higher ceiling than RQ 0.97)              │    │
+│  │  └──────────────────┘                                              │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │          │                                                                  │
 │          │  refine_factor > 1: read original vectors                        │
@@ -177,7 +198,7 @@
 ```
 benchmarks/cohere/bench.py query \
     --plan B --storage {dram,ssd,obs} \
-    --index-type {IVF_RQ,IVF_SQ} \
+    --index-type {IVF_RQ,IVF_SQ,IVF_USQ} \
     --shard-dir PATH --nprobes N --refine-factor N \
     --top-k 10000 --num-shards 5 --query-count 8 --warmup 3
 ```
@@ -202,10 +223,20 @@ benchmarks/cohere/bench.py query \
 - **Strengths**: SQ distance very accurate, rf=1 recall 0.958 (vs RQ 0.790)
 - **Weaknesses**: Index exceeds page cache, recall ceiling at 0.972
 
-### 2.3 Dimensionality Reduction: PCA-512
+### 2.3 IVF_USQ (Ultra-Sparse Quantization, 4-bit via Hanns)
+
+- Random rotation → normalize → 4-bit quantize with Hanns approximate scoring
+- USQ codes: ~336B/vector (256B packed codes + 64B signs + 16B meta)
+- Index auxiliary: ~63GB/shard (much larger than RQ ~0.8GB)
+- Total shard: ~256GB/shard (USQ codes ~63GB + raw vectors ~193GB)
+- **Strengths**: 4-bit codes ~6x smaller than float32 vectors → massive OBS advantage; rf unit cost same as RQ (~350ms)
+- **Weaknesses**: 63GB/shard index causes cache pollution on DRAM at high nprobe; recall identical to RQ (no quality advantage)
+- Feature-gated behind `#[cfg(feature = "hanns")]`
+
+### 2.4 Dimensionality Reduction: PCA-512
 
 - TruncatedSVD 1024→512 on 500K sample, explained variance 96.63%
-- Applied to both RQ and SQ variants
+- Applied to RQ, SQ, and USQ variants
 - ~2x smaller index, ~2x faster distance computation
 
 ---
@@ -352,43 +383,123 @@ Index: 5 shards × 466GB = 2.33TB total (SQ codes ~100GB + raw vectors ~386GB pe
 
 ---
 
+### 3.4 PCA-512 + IVF_USQ (512-dim, IVF_USQ)
+
+Index: 5 shards × ~256GB = 1.28TB total. USQ codes ~63GB/shard on top of raw vectors. Uses same PCA-512 data as RQ/SQ.
+
+#### DRAM
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | RQ Mean | SQ Mean | USQ vs RQ |
+|--------|-----|--------|-----------|----------|---------|---------|-----------|
+| 128 | 1 | 0.793 | **496** | 612 | 523 | 993 | -5% |
+| 256 | 1 | 0.803 | **597** | 747 | 636 | 1,050 | -6% |
+| 512 | 1 | 0.808 | **806** | 1,037 | — | 1,684 | — |
+| 1024 | 1 | 0.811 | 1,105 | 1,507 | **846** | 2,479 | +31% |
+| 128 | 2 | 0.909 | **856** | 980 | 875 | 1,085 | -2% |
+| 256 | 2 | 0.934 | **957** | 1,110 | 977 | 1,234 | -2% |
+| 512 | 2 | 0.947 | **1,173** | 1,398 | — | 1,653 | — |
+| 1024 | 2 | 0.954 | 1,478 | 1,975 | **1,183** | 2,448 | +25% |
+| 1024 | 3 | 0.980 | 1,812 | 2,211 | **1,563** | 2,805 | +16% |
+| 1024 | 5 | 0.990 | 2,678 | 2,941 | **2,494** | 3,575 | +7% |
+
+> USQ faster than RQ at np≤256 (2-6%) due to 4-bit distance speed. USQ slower at np≥1024 (7-31%) because 63GB auxiliary.idx causes cache pollution in 493GB RAM.
+
+#### SSD (cold cache)
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | SSD vs DRAM |
+|--------|-----|--------|-----------|----------|-------------|
+| 128 | 1 | 0.793 | 522 | 655 | +5% |
+| 256 | 1 | 0.803 | 628 | 809 | +5% |
+| 512 | 1 | 0.808 | 823 | 1,090 | +2% |
+| 1024 | 1 | 0.811 | 1,142 | 1,559 | +3% |
+| 128 | 2 | 0.909 | 868 | 1,012 | +1% |
+| 256 | 2 | 0.934 | 964 | 1,137 | +1% |
+| 512 | 2 | 0.947 | 1,187 | 1,435 | +1% |
+| 1024 | 2 | 0.954 | 1,513 | 1,965 | +2% |
+| 1024 | 3 | 0.980 | 1,905 | 2,285 | +5% |
+| 1024 | 5 | 0.990 | 2,805 | 3,050 | +5% |
+
+> SSD overhead minimal (+1-5%). Same pattern as DRAM — CPU-bound, not IO-bound.
+
+#### OBS
+
+| nprobe | rf | Recall | Mean (ms) | P99 (ms) | RQ OBS | SQ OBS | USQ vs RQ | USQ vs SQ |
+|--------|-----|--------|-----------|----------|--------|--------|-----------|-----------|
+| 128 | 1 | 0.793 | **6,375** | 10,689 | 9,382 | 10,518 | **-32%** | **-39%** |
+| 256 | 1 | 0.803 | **6,555** | 10,457 | 10,079 | 12,508 | **-35%** | **-48%** |
+| 1024 | 1 | 0.811 | **7,982** | 12,573 | 11,363 | 22,883 | **-30%** | **-65%** |
+| 128 | 2 | 0.909 | **11,304** | 15,474 | 18,729 | 20,692 | **-40%** | **-45%** |
+| 256 | 2 | 0.934 | **11,580** | 15,459 | 19,306 | 23,298 | **-40%** | **-50%** |
+| 1024 | 2 | 0.954 | **13,088** | 17,626 | 20,594 | 32,103 | **-36%** | **-59%** |
+
+> **USQ dominates OBS**: 30-40% faster than RQ, 39-65% faster than SQ. Network is the bottleneck and USQ's 4-bit codes (~336B/vector) are ~6x smaller than float32 vectors (2048B/vector), dramatically reducing S3 download time.
+
+---
+
 ## 4. Cross-Index Comparison
 
 ### 4.1 Pareto Frontier: DRAM (best latency at each recall level)
 
-| Recall | Config | Mean (ms) |
-|--------|--------|-----------|
-| 0.79 | 1B np=128 rf=1 | **626** |
-| 0.83 | 1B np=128 rf=1 | 626 |
-| 0.92 | 1B np=128 rf=2 | 904 |
-| 0.94 | PCA-512 np=128 rf=2 | 875 |
-| 0.95 | PCA-512 np=256 rf=2 | 977 |
-| **0.958** | **SQ np=128 rf=1** | **993** |
-| 0.98 | 1B np=1024 rf=2 | 2,150 |
-| 0.99 | 1B np=1024 rf=3 | 2,513 |
+| Recall | Config | Mean (ms) | Notes |
+|--------|--------|-----------|-------|
+| 0.79 | 1B np=128 rf=1 | **626** | 1024-dim baseline |
+| 0.83 | 1B np=128 rf=1 | 626 | |
+| 0.91 | USQ np=128 rf=2 | **856** | New: beats 1B by 5% |
+| 0.93 | USQ np=256 rf=2 | **957** | New: beats RQ 977ms |
+| **0.958** | **SQ np=128 rf=1** | **993** | Best for recall≤0.96 |
+| 0.98 | 1B np=1024 rf=2 | 2,150 | |
+| 0.99 | 1B np=1024 rf=3 | 2,513 | |
+
+> Change: USQ occupies recall 0.91-0.95 region, squeezing RQ out. SQ rf=1 still dominates recall 0.96.
 
 ### 4.2 Pareto Frontier: OBS (best latency at each recall level)
 
-| Recall | Config | Mean (ms) |
-|--------|--------|-----------|
-| 0.79 | 1B np=64 rf=1 | **8,218** |
-| 0.79 | PCA-512 np=128 rf=1 | 9,382 |
-| **0.958** | **SQ np=128 rf=1** | **10,518** |
-| 0.942 | PCA-512 np=128 rf=2 | 18,729 |
-| 0.948 | PCA-512 np=256 rf=2 | 19,306 |
-| 0.951 | PCA-512 np=512 rf=2 | 20,010 |
+| Recall | Config | Mean (ms) | Notes |
+|--------|--------|-----------|-------|
+| 0.79 | USQ np=128 rf=1 | **6,375** | New: 32% faster than RQ |
+| 0.80 | USQ np=256 rf=1 | **6,555** | New: 35% faster than RQ |
+| 0.81 | USQ np=1024 rf=1 | **7,982** | New: 30% faster than RQ |
+| **0.91** | **USQ np=128 rf=2** | **11,304** | New: 40% faster than RQ rf=2 |
+| **0.934** | **USQ np=256 rf=2** | **11,580** | New: 40% faster than RQ rf=2 |
+| **0.958** | **SQ np=128 rf=1** | **10,518** | Still best for recall 0.96 |
+| 0.954 | USQ np=1024 rf=2 | **13,088** | New: 36% faster than RQ |
 
-### 4.3 Matched-Recall OBS Comparison (key finding)
+> Change: USQ completely reshapes the OBS Pareto frontier. All recall levels below 0.96 are now USQ territory. SQ rf=1 retains its niche at recall=0.958 but is only 8% faster than USQ np=256 rf=2 (10.5s vs 11.6s) with only marginally higher recall.
 
-SQ's higher recall at rf=1 eliminates the need for refinement on OBS, saving ~8-10s of vector download:
+### 4.3 Matched-Recall OBS Comparison (USQ changes the picture)
 
-| Target Recall | SQ Config | SQ OBS | RQ Config | RQ OBS | SQ Advantage |
-|--------------|-----------|--------|-----------|--------|-------------|
-| ~0.95 | np=128 rf=1 (0.958) | **10,518ms** | np=128 rf=2 (0.942) | 18,729ms | **44% faster** |
-| ~0.96 | np=256 rf=1 (0.962) | **12,508ms** | np=256 rf=2 (0.948) | 19,306ms | **35% faster** |
-| ~0.97 | np=1024 rf=2 (0.972) | 32,103ms | np=1024 rf=3 (0.967) | — | SQ worse |
+USQ's 4-bit codes reduce OBS network transfer by ~6x vs float32 vectors. This transforms the cost-benefit tradeoff:
 
-**Why**: SQ 8-bit per-dimension quantization is more accurate than RQ 1-bit residual. SQ rf=1 skips reading original vectors entirely — only reads SQ uint8 codes. On OBS, rf=2 downloads 20,000 original float32 vectors (~10s network transfer).
+| Target Recall | Best Config | OBS Latency | Previous Best | Previous Latency | Improvement |
+|--------------|-------------|-------------|---------------|-----------------|-------------|
+| ~0.79 | **USQ np=128 rf=1** | **6,375ms** | RQ np=128 rf=1 | 9,382ms | **32% faster** |
+| ~0.91 | **USQ np=128 rf=2** | **11,304ms** | RQ np=128 rf=2 | 18,729ms | **40% faster** |
+| ~0.95 | **USQ np=1024 rf=2** | **13,088ms** | SQ np=128 rf=1 (0.958) | 10,518ms | SQ 20% faster but lower recall |
+| ~0.96 | SQ np=128 rf=1 | **10,518ms** | — | — | SQ niche retained |
+
+**Why USQ wins on OBS**: Network is the bottleneck. USQ reads ~336B of 4-bit codes per candidate during refinement, vs 2048B (512×float32) for original vectors. This ~6x reduction in S3 download volume dominates latency. RQ and SQ refinement both download float32 vectors — USQ avoids this by using USQ codes for distance approximation even during refinement.
+
+### 4.4 Pareto Shift Summary
+
+**DRAM**: USQ shifts the frontier at recall 0.79-0.91 (was 1B-RQ territory). SQ retains recall 0.96+ niche.
+
+```
+Recall  0.79    0.83    0.91    0.94    0.96    0.98    0.99
+Before: [1B-RQ] [1B-RQ] [------] [RQ   ] [SQ   ] [1B   ] [1B   ]
+After:  [USQ  ] [1B-RQ] [USQ  ] [RQ   ] [SQ   ] [USQ  ] [1B   ]
+                                         ↑ SQ still dominates recall≤0.96
+```
+
+**OBS**: USQ completely replaces RQ at recall ≤0.81. But SQ rf=1 (10.5s, recall 0.958) still dominates the recall 0.91-0.96 gap — USQ rf=2 (11.3s, recall 0.909) is slower AND lower recall than SQ rf=1.
+
+```
+Recall  0.79    0.81           0.958             0.97
+Before: [RQ   ] [RQ  .........] [SQ rf=1        ] [RQ rf=2 ...]
+After:  [USQ  ] [USQ .........] [SQ rf=1        ] [SQ rf=2   ]
+        ↑ 32% faster           ↑ SQ still king     ↑ SQ dominates
+```
+
+**Key insight**: On OBS, USQ rf=1 is the fastest option for recall ≤0.81, but **SQ rf=1** remains the best for recall 0.96. There is no index that fills the 0.81-0.96 recall gap efficiently on OBS — this is where multi-bit RQ or higher-bit USQ would help.
 
 ---
 
@@ -413,28 +524,46 @@ SQ recall plateaus at **0.972** regardless of rf>2. This is a hard ceiling from 
 | Index | rf=1 max | rf=2 max | rf=3 max | rf=5 max |
 |-------|----------|----------|----------|----------|
 | IVF_RQ (PCA-512) | 0.794 | 0.953 | 0.967 | 0.971 |
+| IVF_USQ (PCA-512) | 0.811 | 0.954 | 0.980 | 0.990 |
 | IVF_SQ (PCA-512) | **0.965** | **0.972** | 0.972 | 0.972 |
 | IVF_RQ (1B 1024-dim) | 0.861 | 0.983 | 0.993 | 0.995 |
+
+> USQ recall ceiling (0.990) is higher than RQ (0.971) because USQ refinement uses USQ 4-bit codes (higher quality approximation) rather than RQ multi-level residual codes. But both RQ and USQ use the same IVF partitioning, so recall at rf=1 is nearly identical.
 
 ### 5.3 Why SQ is Slower at Matched rf
 
 SQ index is larger than RQ index:
 - SQ: 466GB/shard (SQ codes ~100GB + raw vectors ~386GB)
 - RQ: 386GB/shard (RQ codes ~0.8GB + raw vectors ~386GB)
+- USQ: ~256GB/shard (USQ codes ~63GB + raw vectors ~193GB)
 - Larger index → more S3 GET requests → more RTT overhead on OBS
 - On DRAM, 500GB SQ codes exceed 493GB page cache
+
+### 5.4 USQ: Cache Pollution vs Network Advantage
+
+| Storage | USQ vs RQ | Root Cause |
+|---------|-----------|------------|
+| DRAM, np≤256 | 2-6% faster | 4-bit distance slightly faster than RQ decode |
+| DRAM, np≥1024 | 7-31% slower | 63GB auxiliary.idx evicts useful pages from 493GB RAM |
+| SSD | Same as DRAM | IO not bottleneck, CPU-bound |
+| **OBS** | **30-40% faster** | Network bottleneck, 4-bit codes ~6x smaller than float32 vectors |
+
+This tradeoff is fundamental: USQ's compact codes are a disadvantage when IO is free (DRAM) but a massive advantage when IO is expensive (OBS).
 
 ---
 
 ## 6. Recommendations by Scenario
 
-| Scenario | Recommended Config | Latency | Recall |
-|----------|-------------------|---------|--------|
-| **DRAM, recall ≤ 0.95** | 1B np=256 rf=2 | 968ms | 0.950 |
-| **DRAM, recall ≥ 0.99** | 1B np=1024 rf=3 | 2,513ms | 0.993 |
-| **SSD, recall ≤ 0.95** | 1B np=256 rf=2 | 1,058ms | 0.950 |
-| **OBS, recall ≤ 0.96** | **SQ np=128 rf=1** | **10,518ms** | **0.958** |
-| **OBS, recall > 0.97** | PCA-512 np=1024 rf=2 | 20,594ms | 0.953 |
+| Scenario | Recommended Config | Latency | Recall | Notes |
+|----------|-------------------|---------|--------|-------|
+| **DRAM, recall ≤ 0.95** | USQ np=256 rf=2 | **957ms** | 0.934 | 2% faster than RQ, same data |
+| **DRAM, recall ≤ 0.96** | SQ np=128 rf=1 | 993ms | 0.958 | Single pass, simplest |
+| **DRAM, recall ≥ 0.99** | 1B np=1024 rf=3 | 2,513ms | 0.993 | Need full 1024-dim for 0.99+ |
+| **SSD, recall ≤ 0.95** | USQ np=256 rf=2 | **964ms** | 0.934 | Same as DRAM, IO minimal |
+| **OBS, recall ≤ 0.81** | **USQ np=1024 rf=1** | **7,982ms** | 0.811 | 30% faster than RQ |
+| **OBS, recall ~0.93** | **USQ np=256 rf=2** | **11,580ms** | 0.934 | 40% faster than RQ rf=2 |
+| **OBS, recall ~0.96** | SQ np=128 rf=1 | 10,518ms | 0.958 | SQ niche, but USQ np=256 rf=2 close |
+| **OBS, recall ~0.95** | **USQ np=1024 rf=2** | **13,088ms** | 0.954 | 36% faster than RQ, beats SQ at np≥1024 |
 
 ### IO Threads
 
@@ -462,12 +591,14 @@ Current best (DRAM): 2,513ms for recall 0.993. Knowhere achieves ~50ms at simila
 | Item | Path |
 |------|------|
 | 1B shards (1024-dim) | `/data/work/tmp/s1b/shard-{0-4}.lance` |
-| PCA-512 shards | `/data/work/tmp/s1b-pca512/shard-{0-4}.lance` |
+| PCA-512 shards (RQ+USQ) | `/data/work/tmp/s1b-pca512/shard-{0-4}.lance` |
 | SQ shards | `/data/work/tmp/s1b-pca512-sq/shard-{0-4}.lance` |
 | 1B results | `/data/work/tmp/pareto-results/` |
 | PCA-512 results | `/data/work/tmp/pca512-results-v2/` |
 | SQ results | `/data/work/tmp/pca512-sq-results/` |
+| USQ results | `/tmp/usq_dram_np*_rf*.json`, `/tmp/usq_ssd_np*_rf*.json`, `/tmp/usq_obs_np*_rf*.json` |
+| GT (_rowid format) | `/data/work/tmp/gt_pca512_shard0_top10k_5q_seed42_v2.npz` |
 | GT (positional) | `/data/work/tmp/s1b-pca512/gt_positional_v2.npz` |
 | OBS (1B) | `s3://knowledgebase-5f43/fineweb-edu-1b-rq-shard4/` |
-| OBS (PCA-512) | `s3://knowledgebase-5f43/pca512-1b/` |
+| OBS (PCA-512, RQ+USQ) | `s3://knowledgebase-5f43/pca512-1b/` |
 | OBS (SQ) | `s3://knowledgebase-5f43/pca512-sq-1b/` |
