@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -44,11 +45,46 @@ fn encode_vector(
     }
 }
 
+/// Wrapper that makes `Arc<OnceLock<UsqQuantizer>>` play nicely with derive macros.
+/// Cloning shares the same underlying OnceLock, so QR is initialized at most once.
+struct SharedQuantizer(Arc<OnceLock<hanns::quantization::usq::UsqQuantizer>>);
+
+impl SharedQuantizer {
+    fn new() -> Self {
+        SharedQuantizer(Arc::new(OnceLock::new()))
+    }
+
+    fn get_or_init(&self, config: hanns::quantization::usq::UsqConfig) -> &hanns::quantization::usq::UsqQuantizer {
+        self.0.get_or_init(|| new_hanns_quantizer(config))
+    }
+}
+
+impl Clone for SharedQuantizer {
+    fn clone(&self) -> Self {
+        SharedQuantizer(Arc::clone(&self.0))
+    }
+}
+
+impl std::fmt::Debug for SharedQuantizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SharedQuantizer(initialized={})", self.0.get().is_some())
+    }
+}
+
+impl DeepSizeOf for SharedQuantizer {
+    fn deep_size_of_children(&self, _ctx: &mut deepsize::Context) -> usize {
+        0
+    }
+}
+
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct USQuantizer {
     dim: usize,
     num_bits: u8,
     rotation_seed: u64,
+    /// Lazily initialized on first transform() call and reused across all subsequent batches.
+    /// QR decomposition (O(d³)) runs exactly once regardless of number of IVF batches.
+    cached_quantizer: SharedQuantizer,
 }
 
 impl USQuantizer {
@@ -57,6 +93,7 @@ impl USQuantizer {
             dim,
             num_bits,
             rotation_seed,
+            cached_quantizer: SharedQuantizer::new(),
         }
     }
 
@@ -103,14 +140,16 @@ impl USQuantizer {
                 .map_err(|e| Error::index(format!("USQ config error: {}", e)))?
                 .with_seed(self.rotation_seed);
 
+        // Get (or lazily init) the shared quantizer — QR decomposition runs at most ONCE
+        // across all batches. encode() takes &self + uses thread-local workspace, so
+        // sharing &quantizer across Rayon workers is safe without any locking.
+        let quantizer = self.cached_quantizer.get_or_init(usq_config);
+
         // Encode vectors in parallel using rayon
         let results: Vec<Result<EncodedVector>> = values
             .values()
             .par_chunks_exact(dim)
-            .map_init(
-                || new_hanns_quantizer(usq_config.clone()),
-                |quantizer, vector| Ok(encode_vector(quantizer, vector)),
-            )
+            .map(|vector| Ok(encode_vector(&quantizer, vector)))
             .collect();
 
         for (i, result) in results.into_iter().enumerate() {
