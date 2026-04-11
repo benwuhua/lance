@@ -54,7 +54,6 @@ impl QuantizerMetadata for UsqQuantizationMetadata {
     }
 }
 
-#[derive(Debug)]
 pub struct USQStorage {
     metadata: UsqQuantizationMetadata,
     batch: RecordBatch,
@@ -69,6 +68,20 @@ pub struct USQStorage {
     /// Cached quantizer — QR decomposition (O(d³)) runs once per partition load,
     /// not once per query call to dist_calculator().
     cached_quantizer: OnceLock<hanns::quantization::usq::UsqQuantizer>,
+}
+
+impl std::fmt::Debug for USQStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("USQStorage")
+            .field("metadata", &self.metadata)
+            .field("batch", &self.batch)
+            .field("distance_type", &self.distance_type)
+            .field("row_ids", &self.row_ids)
+            .field("codes", &self.codes)
+            .field("signs", &self.signs)
+            .field("meta", &self.meta)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Clone for USQStorage {
@@ -93,6 +106,18 @@ impl DeepSizeOf for USQStorage {
     }
 }
 
+fn empty_signs(num_rows: usize) -> FixedSizeListArray {
+    FixedSizeListArray::new_null(
+        Arc::new(arrow_schema::Field::new(
+            "item",
+            arrow_schema::DataType::UInt8,
+            true,
+        )),
+        0,
+        num_rows,
+    )
+}
+
 #[async_trait]
 impl QuantizerStorage for USQStorage {
     type Metadata = UsqQuantizationMetadata;
@@ -107,7 +132,10 @@ impl QuantizerStorage for USQStorage {
             .as_primitive::<arrow::datatypes::UInt64Type>()
             .clone();
         let codes = batch[USQ_CODE_COLUMN].as_fixed_size_list().clone();
-        let signs = batch[USQ_SIGN_COLUMN].as_fixed_size_list().clone();
+        let signs = batch
+            .column_by_name(USQ_SIGN_COLUMN)
+            .map(|arr| arr.as_fixed_size_list().clone())
+            .unwrap_or_else(|| empty_signs(batch.num_rows()));
         let meta = batch[USQ_META_COLUMN].as_fixed_size_list().clone();
 
         Ok(Self {
@@ -134,7 +162,14 @@ impl QuantizerStorage for USQStorage {
         frag_reuse_index: Option<Arc<crate::frag_reuse::FragReuseIndex>>,
     ) -> Result<Self> {
         let schema = reader.schema();
-        let batch = reader.read_range(range, schema).await?;
+        let batch = match schema.project_preserve_system_columns(&[
+            ROW_ID,
+            USQ_CODE_COLUMN,
+            USQ_META_COLUMN,
+        ]) {
+            Ok(projected_schema) => reader.read_range(range, &projected_schema).await?,
+            Err(_) => reader.read_range(range, schema).await?,
+        };
         Self::try_from_batch(batch, metadata, distance_type, frag_reuse_index)
     }
 }
@@ -257,5 +292,106 @@ impl VectorStore for USQStorage {
 
     fn dist_calculator_from_id(&self, _id: u32) -> Self::DistanceCalculator<'_> {
         unimplemented!("USQ does not support dist_calculator_from_id")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Float32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::datatypes::Schema;
+    use lance_io::object_store::ObjectStore;
+    use lance_table::format::SelfDescribingFileReader;
+    use lance_table::io::manifest::ManifestDescribing;
+    use object_store::path::Path;
+
+    use crate::vector::CENTROID_DIST_COLUMN;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_load_partition_projects_search_columns() {
+        let object_store = ObjectStore::memory();
+        let path = Path::from("/usq_storage_projection");
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(CENTROID_DIST_COLUMN, DataType::Float32, true),
+            Field::new(
+                USQ_CODE_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), 4),
+                true,
+            ),
+            Field::new(
+                USQ_SIGN_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), 1),
+                true,
+            ),
+            Field::new(
+                USQ_META_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let mut writer =
+            lance_file::previous::writer::FileWriter::<ManifestDescribing>::try_new(
+            &object_store,
+            &path,
+            schema,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let row_ids = Arc::new(UInt64Array::from(vec![10_u64, 20_u64]));
+        let centroid_dists = Arc::new(Float32Array::from(vec![0.25_f32, 0.5_f32]));
+        let codes = Arc::new(FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![1_u8, 2, 3, 4, 5, 6, 7, 8]),
+            4,
+        )
+        .unwrap());
+        let signs = Arc::new(FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![0_u8, 1_u8]),
+            1,
+        )
+        .unwrap());
+        let meta = Arc::new(FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0_f32, 1.0_f32, 2.0_f32, 3.0_f32, 4.0_f32, 16.0_f32, 5.0_f32, 6.0_f32,
+            ]),
+            4,
+        )
+        .unwrap());
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![row_ids, centroid_dists, codes, signs, meta],
+        )
+        .unwrap();
+        writer.write(&[batch]).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+            .await
+            .unwrap();
+        let metadata = UsqQuantizationMetadata {
+            dim: 8,
+            num_bits: 4,
+            rotation_seed: 42,
+        };
+
+        let storage =
+            USQStorage::load_partition(&reader, 0..2, DistanceType::L2, &metadata, None)
+                .await
+                .unwrap();
+
+        assert_eq!(storage.batch.num_columns(), 3);
+        assert!(storage.batch.column_by_name(ROW_ID).is_some());
+        assert!(storage.batch.column_by_name(USQ_CODE_COLUMN).is_some());
+        assert!(storage.batch.column_by_name(USQ_META_COLUMN).is_some());
+        assert!(storage.batch.column_by_name(USQ_SIGN_COLUMN).is_none());
+        assert!(storage.batch.column_by_name(CENTROID_DIST_COLUMN).is_none());
     }
 }
