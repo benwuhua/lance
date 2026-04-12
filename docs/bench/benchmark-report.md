@@ -456,32 +456,30 @@ Index: 5 shards × ~256GB = 1.28TB total. USQ codes ~63GB/shard on top of raw ve
 
 | Recall | Config | Mean (ms) | Notes |
 |--------|--------|-----------|-------|
-| 0.79 | USQ np=128 rf=1 | **6,375** | New: 32% faster than RQ |
-| 0.80 | USQ np=256 rf=1 | **6,555** | New: 35% faster than RQ |
-| 0.81 | USQ np=1024 rf=1 | **7,982** | New: 30% faster than RQ |
-| **0.91** | **USQ np=128 rf=2** | **11,304** | New: 40% faster than RQ rf=2 |
-| **0.934** | **USQ np=256 rf=2** | **11,580** | New: 40% faster than RQ rf=2 |
-| **0.958** | **SQ np=128 rf=1** | **10,518** | Still best for recall 0.96 |
-| 0.954 | USQ np=1024 rf=2 | **13,088** | New: 36% faster than RQ |
+| 0.7926 | USQ4 np=128 rf=1 | **6,375** | Fastest low-recall OBS point |
+| 0.8032 | USQ4 np=256 rf=1 | **6,555** | Small recall bump for +180ms |
+| **0.9730** | **USQ8 np=256 rf=1** | **7,710** | Refresh: dominates SQ and RQ high-recall region |
+| 0.9949 | USQ8 np=1024 rf=1 | **21,312** | Best sub-0.995 recall on OBS |
+| 0.9967 | USQ8 np=1024 rf=2 | **27,988** | Highest observed recall on OBS |
 
-> Change: USQ completely reshapes the OBS Pareto frontier. All recall levels below 0.96 are now USQ territory. SQ rf=1 retains its niche at recall=0.958 but is only 8% faster than USQ np=256 rf=2 (10.5s vs 11.6s) with only marginally higher recall.
+> Refresh (2026-04-12): `USQ8 np=256 rf=1` reran at `7.71s` instead of `9.93s`. That single point collapses the old 0.81-0.96 OBS gap: SQ rf=1 is no longer a frontier point, and all intermediate USQ rf=2 points are dominated.
 
 ### 4.3 Matched-Recall OBS Comparison (USQ changes the picture)
 
-USQ's 4-bit codes reduce OBS network transfer by ~6x vs float32 vectors. This transforms the cost-benefit tradeoff:
+With the refreshed OBS run, the frontier splits cleanly: USQ4 owns low recall, USQ8 owns high recall.
 
 | Target Recall | Best Config | OBS Latency | Previous Best | Previous Latency | Improvement |
 |--------------|-------------|-------------|---------------|-----------------|-------------|
-| ~0.79 | **USQ np=128 rf=1** | **6,375ms** | RQ np=128 rf=1 | 9,382ms | **32% faster** |
-| ~0.91 | **USQ np=128 rf=2** | **11,304ms** | RQ np=128 rf=2 | 18,729ms | **40% faster** |
-| ~0.95 | **USQ np=1024 rf=2** | **13,088ms** | SQ np=128 rf=1 (0.958) | 10,518ms | SQ 20% faster but lower recall |
-| ~0.96 | SQ np=128 rf=1 | **10,518ms** | — | — | SQ niche retained |
+| ~0.79 | **USQ4 np=128 rf=1** | **6,375ms** | RQ np=128 rf=1 | 9,382ms | **32% faster** |
+| ~0.80 | **USQ4 np=256 rf=1** | **6,555ms** | RQ np=256 rf=1 | 10,079ms | **35% faster** |
+| ~0.96-0.97 | **USQ8 np=256 rf=1 (0.973)** | **7,710ms** | SQ np=128 rf=1 (0.958) | 10,518ms | **27% faster and higher recall** |
+| ~0.995 | **USQ8 np=1024 rf=1** | **21,312ms** | none | — | New frontier point |
 
-**Why USQ wins on OBS**: Network is the bottleneck. USQ reads ~336B of 4-bit codes per candidate during refinement, vs 2048B (512×float32) for original vectors. This ~6x reduction in S3 download volume dominates latency. RQ and SQ refinement both download float32 vectors — USQ avoids this by using USQ codes for distance approximation even during refinement.
+**Why the frontier moved**: the refreshed `USQ8 np=256 rf=1` point avoids the extra rerank stage yet still lands at `0.973` recall. On OBS that is the winning combination: higher-code-fidelity than USQ4, but still no float32 download path. Once that point moved down to `7.71s`, SQ lost its former `0.958` niche.
 
 ### 4.4 Pareto Shift Summary
 
-**DRAM**: USQ shifts the frontier at recall 0.79-0.91 (was 1B-RQ territory). SQ retains recall 0.96+ niche.
+**DRAM**: unchanged by the OBS refresh. USQ shifts the frontier at recall 0.79-0.91 (was 1B-RQ territory). SQ retains recall 0.96+ niche.
 
 ```
 Recall  0.79    0.83    0.91    0.94    0.96    0.98    0.99
@@ -490,16 +488,16 @@ After:  [USQ  ] [1B-RQ] [USQ  ] [RQ   ] [SQ   ] [USQ  ] [1B   ]
                                          ↑ SQ still dominates recall≤0.96
 ```
 
-**OBS**: USQ completely replaces RQ at recall ≤0.81. But SQ rf=1 (10.5s, recall 0.958) still dominates the recall 0.91-0.96 gap — USQ rf=2 (11.3s, recall 0.909) is slower AND lower recall than SQ rf=1.
+**OBS**: the refreshed frontier is now almost entirely USQ. USQ4 owns the low-recall `0.79-0.80` points, and USQ8 jumps straight to `0.973` at `7.71s`. SQ rf=1 no longer survives as a Pareto point.
 
 ```
-Recall  0.79    0.81           0.958             0.97
-Before: [RQ   ] [RQ  .........] [SQ rf=1        ] [RQ rf=2 ...]
-After:  [USQ  ] [USQ .........] [SQ rf=1        ] [SQ rf=2   ]
-        ↑ 32% faster           ↑ SQ still king     ↑ SQ dominates
+Recall  0.79    0.80              0.973              0.995    0.997
+Before: [RQ   ] [RQ  .........]   [SQ rf=1        ]  [none ] [none ]
+After:  [USQ4 ] [USQ4 ........]   [USQ8 rf=1      ]  [USQ8 ] [USQ8 ]
+        ↑ low-recall speed        ↑ gap collapsed     ↑ only high-recall frontier
 ```
 
-**Key insight**: On OBS, USQ rf=1 is the fastest option for recall ≤0.81, but **SQ rf=1** remains the best for recall 0.96. There is no index that fills the 0.81-0.96 recall gap efficiently on OBS — this is where multi-bit RQ or higher-bit USQ would help.
+**Key insight**: On OBS, the old `0.81-0.96` Pareto gap is gone. The frontier is now `USQ4` for low recall and `USQ8` for high recall. Multi-bit RQ is still relevant for DRAM work, but it is no longer needed to explain the OBS gap in this PCA-512 benchmark.
 
 ---
 
@@ -560,10 +558,10 @@ This tradeoff is fundamental: USQ's compact codes are a disadvantage when IO is 
 | **DRAM, recall ≤ 0.96** | SQ np=128 rf=1 | 993ms | 0.958 | Single pass, simplest |
 | **DRAM, recall ≥ 0.99** | 1B np=1024 rf=3 | 2,513ms | 0.993 | Need full 1024-dim for 0.99+ |
 | **SSD, recall ≤ 0.95** | USQ np=256 rf=2 | **964ms** | 0.934 | Same as DRAM, IO minimal |
-| **OBS, recall ≤ 0.81** | **USQ np=1024 rf=1** | **7,982ms** | 0.811 | 30% faster than RQ |
-| **OBS, recall ~0.93** | **USQ np=256 rf=2** | **11,580ms** | 0.934 | 40% faster than RQ rf=2 |
-| **OBS, recall ~0.96** | SQ np=128 rf=1 | 10,518ms | 0.958 | SQ niche, but USQ np=256 rf=2 close |
-| **OBS, recall ~0.95** | **USQ np=1024 rf=2** | **13,088ms** | 0.954 | 36% faster than RQ, beats SQ at np≥1024 |
+| **OBS, recall ≤ 0.80** | **USQ4 np=256 rf=1** | **6,555ms** | 0.803 | Fastest low-recall frontier point |
+| **OBS, recall ~0.97** | **USQ8 np=256 rf=1** | **7,710ms** | 0.973 | New dominant high-recall frontier point |
+| **OBS, recall ~0.995** | **USQ8 np=1024 rf=1** | **21,312ms** | 0.9949 | Best sub-0.995 high-recall point |
+| **OBS, max recall tested** | **USQ8 np=1024 rf=2** | **27,988ms** | 0.9967 | Only for the last ~0.002 recall |
 
 ### IO Threads
 
