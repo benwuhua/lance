@@ -16,7 +16,7 @@ use rayon::prelude::*;
 
 use crate::vector::quantizer::{Quantization, Quantizer};
 use crate::vector::usq::storage::{USQStorage, UsqQuantizationMetadata};
-use crate::vector::usq::{USQBuildParams, USQ_CODE_COLUMN, USQ_META_COLUMN, USQ_METADATA_KEY, USQ_SIGN_COLUMN};
+use crate::vector::usq::{USQBuildParams, USQ_CODE_COLUMN, USQ_META_COLUMN, USQ_METADATA_KEY};
 
 #[cfg(test)]
 static HANNS_QUANTIZER_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -37,7 +37,6 @@ fn encode_vector(
     let encoded = quantizer.encode(vector);
     EncodedVector {
         packed_bits: encoded.packed_bits,
-        sign_bits: encoded.sign_bits,
         norm: encoded.norm,
         norm_sq: encoded.norm_sq,
         vmax: encoded.vmax,
@@ -115,21 +114,14 @@ impl USQuantizer {
         self.padded_dim() * self.num_bits as usize / 8
     }
 
-    /// Sign bytes per vector.
-    pub fn sign_bytes(&self) -> usize {
-        self.padded_dim() / 8
-    }
-
     pub(crate) fn transform(&self, vectors: &FixedSizeListArray) -> Result<EncodedBatch> {
         let n = vectors.len();
         let dim = vectors.value_length() as usize;
         let values = vectors.values().as_primitive::<arrow::datatypes::Float32Type>();
 
         let code_bytes = self.code_bytes();
-        let sign_bytes = self.sign_bytes();
 
         let mut packed_bits = vec![0u8; n * code_bytes];
-        let mut sign_bits = vec![0u8; n * sign_bytes];
         let mut norms = Vec::with_capacity(n);
         let mut norms_sq = Vec::with_capacity(n);
         let mut vmaxs = Vec::with_capacity(n);
@@ -155,7 +147,6 @@ impl USQuantizer {
         for (i, result) in results.into_iter().enumerate() {
             let encoded = result?;
             packed_bits[i * code_bytes..(i + 1) * code_bytes].copy_from_slice(&encoded.packed_bits);
-            sign_bits[i * sign_bytes..(i + 1) * sign_bytes].copy_from_slice(&encoded.sign_bits);
             norms.push(encoded.norm);
             norms_sq.push(encoded.norm_sq);
             vmaxs.push(encoded.vmax);
@@ -164,7 +155,6 @@ impl USQuantizer {
 
         Ok(EncodedBatch {
             packed_bits,
-            sign_bits,
             norms,
             norms_sq,
             vmaxs,
@@ -175,7 +165,6 @@ impl USQuantizer {
 
 pub(crate) struct EncodedVector {
     pub packed_bits: Vec<u8>,
-    pub sign_bits: Vec<u8>,
     pub norm: f32,
     pub norm_sq: f32,
     pub vmax: f32,
@@ -184,7 +173,6 @@ pub(crate) struct EncodedVector {
 
 pub(crate) struct EncodedBatch {
     pub packed_bits: Vec<u8>,
-    pub sign_bits: Vec<u8>,
     pub norms: Vec<f32>,
     pub norms_sq: Vec<f32>,
     pub vmaxs: Vec<f32>,
@@ -285,24 +273,14 @@ impl Quantization for USQuantizer {
     }
 
     fn extra_fields(&self) -> Vec<Field> {
-        vec![
-            Field::new(
-                USQ_SIGN_COLUMN,
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::UInt8, true)),
-                    self.sign_bytes() as i32,
-                ),
-                true,
+        vec![Field::new(
+            USQ_META_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                4, // norm, norm_sq, vmax, quant_quality
             ),
-            Field::new(
-                USQ_META_COLUMN,
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    4, // norm, norm_sq, vmax, quant_quality
-                ),
-                true,
-            ),
-        ]
+            true,
+        )]
     }
 }
 

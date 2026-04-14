@@ -66,17 +66,11 @@ impl Transformer for USQTransformer {
         let encoded = self.quantizer.transform(fsl)?;
 
         let code_bytes = self.quantizer.code_bytes();
-        let sign_bytes = self.quantizer.sign_bytes();
 
         // Add USQ code column
         let codes = UInt8Array::from(encoded.packed_bits);
         let code_fsl = FixedSizeListArray::try_new_from_values(codes, code_bytes as i32)?;
         arrays.push((USQ_CODE_COLUMN.to_string(), Arc::new(code_fsl)));
-
-        // Add USQ sign column
-        let signs = UInt8Array::from(encoded.sign_bits);
-        let sign_fsl = FixedSizeListArray::try_new_from_values(signs, sign_bytes as i32)?;
-        arrays.push((USQ_SIGN_COLUMN.to_string(), Arc::new(sign_fsl)));
 
         // Add USQ meta column (norm, norm_sq, vmax, quant_quality as f32)
         let meta_values: Vec<f32> = encoded
@@ -100,5 +94,61 @@ impl Transformer for USQTransformer {
         let columns: Vec<ArrayRef> = arrays.into_iter().map(|(_, arr)| arr).collect();
 
         Ok(arrow_array::RecordBatch::try_new(Arc::new(schema), columns)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_core::ROW_ID;
+
+    use crate::vector::usq::USQ_SIGN_COLUMN;
+
+    #[test]
+    fn transform_emits_signless_usq_columns() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                USQ_SIGN_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), 8),
+                true,
+            ),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    8,
+                ),
+                true,
+            ),
+        ]));
+
+        let row_ids = Arc::new(UInt64Array::from(vec![1_u64, 2_u64]));
+        let stale_signs = Arc::new(
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0_u8; 16]), 8).unwrap(),
+        );
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![
+                    0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3,
+                    0.2, 0.1,
+                ]),
+                8,
+            )
+            .unwrap(),
+        );
+
+        let batch = RecordBatch::try_new(schema, vec![row_ids, stale_signs, vectors]).unwrap();
+        let transformer = USQTransformer::new(USQuantizer::new(8, 4, 42));
+
+        let transformed = transformer.transform(&batch).unwrap();
+
+        assert!(transformed.column_by_name(ROW_ID).is_some());
+        assert!(transformed.column_by_name(USQ_CODE_COLUMN).is_some());
+        assert!(transformed.column_by_name(USQ_META_COLUMN).is_some());
+        assert!(transformed.column_by_name(USQ_SIGN_COLUMN).is_none());
+        assert!(transformed.column_by_name("vector").is_none());
     }
 }
