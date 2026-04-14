@@ -1048,8 +1048,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let is_pq = Q::quantization_type() == QuantizationType::Product;
+        #[cfg(not(feature = "hanns"))]
+        let is_rq = Q::quantization_type() == QuantizationType::Rabit;
+        #[cfg(feature = "hanns")]
         let is_rq = Q::quantization_type() == QuantizationType::Rabit
-            || cfg!(feature = "hanns") && Q::quantization_type() == QuantizationType::Usq;
+            || Q::quantization_type() == QuantizationType::Usq;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);

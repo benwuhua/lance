@@ -736,7 +736,9 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        io_concurrency: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        let concurrency = io_concurrency;
         let stream = futures::stream::once(async move {
             let max_nprobes = query
                 .maximum_nprobes
@@ -845,7 +847,7 @@ impl ANNIvfSubIndexExec {
                     let found_so_far = state_clone.num_results_found.load(Ordering::Relaxed);
                     std::future::ready(found_so_far < max_results)
                 })
-                .buffered(get_num_compute_intensive_cpus())
+                .buffered(concurrency)
                 .boxed()
         });
         stream.flatten()
@@ -859,8 +861,10 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        io_concurrency: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
+        let concurrency = io_concurrency;
         metrics.partitions_searched.add(minimum_nprobes);
 
         futures::stream::iter(0..minimum_nprobes)
@@ -895,7 +899,7 @@ impl ANNIvfSubIndexExec {
                     Ok(batch)
                 }
             })
-            .buffered(get_num_compute_intensive_cpus())
+            .buffered(concurrency)
     }
 }
 
@@ -1053,6 +1057,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
+                        let io_concurrency = ds.object_store().io_parallelism();
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),
@@ -1062,6 +1067,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter.clone(),
                             metrics.clone(),
                             state.clone(),
+                            io_concurrency,
                         );
                         let late_search = Self::late_search(
                             raw_index.clone(),
@@ -1071,6 +1077,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter,
                             metrics,
                             state,
+                            io_concurrency,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
