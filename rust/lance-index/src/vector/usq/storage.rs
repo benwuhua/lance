@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::AsArray;
-use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
@@ -299,18 +299,112 @@ impl VectorStore for USQStorage {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Float32Array, RecordBatch};
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::Schema;
+    use lance_core::ROW_ID;
     use lance_io::object_store::ObjectStore;
     use lance_table::format::SelfDescribingFileReader;
     use lance_table::io::manifest::ManifestDescribing;
     use object_store::path::Path;
 
     use crate::vector::CENTROID_DIST_COLUMN;
+    use crate::vector::quantizer::QuantizerStorage;
+    use crate::vector::storage::VectorStore;
+    use crate::vector::usq::builder::USQuantizer;
 
     use super::*;
+
+    fn build_signless_storage(
+        raw_vectors: &[Vec<f32>],
+        num_bits: u8,
+    ) -> (USQStorage, Vec<(f32, f32, f32, f32)>, Vec<u64>, usize) {
+        let dim = raw_vectors.first().map(|v| v.len()).unwrap_or_default();
+        let quantizer = USQuantizer::new(dim, num_bits, 42);
+        let mut packed_bits = Vec::new();
+        let mut meta_values = Vec::new();
+        let mut encoded_rows = Vec::new();
+
+        for vector in raw_vectors {
+            let encoded = quantizer
+                .transform(
+                    &FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vector.clone()),
+                        dim as i32,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            packed_bits.extend_from_slice(&encoded.packed_bits);
+            meta_values.extend(
+                encoded
+                    .norms
+                    .iter()
+                    .zip(encoded.norms_sq.iter())
+                    .zip(encoded.vmaxs.iter())
+                    .zip(encoded.quant_qualities.iter())
+                    .flat_map(|(((n, ns), vm), qq)| [*n, *ns, *vm, *qq]),
+            );
+            encoded_rows.push((
+                encoded.norms[0],
+                encoded.norms_sq[0],
+                encoded.vmaxs[0],
+                encoded.quant_qualities[0],
+            ));
+        }
+
+        let code_bytes = quantizer.code_bytes();
+        let row_ids: Vec<u64> = (0..raw_vectors.len()).map(|idx| (idx + 1) as u64 * 10).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new(ROW_ID, DataType::UInt64, false),
+                Field::new(
+                    USQ_CODE_COLUMN,
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::UInt8, true)),
+                        code_bytes as i32,
+                    ),
+                    true,
+                ),
+                Field::new(
+                    USQ_META_COLUMN,
+                    DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(row_ids.clone())),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        UInt8Array::from(packed_bits),
+                        code_bytes as i32,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(meta_values), 4)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let metadata = UsqQuantizationMetadata {
+            dim: dim as u32,
+            num_bits,
+            rotation_seed: 42,
+        };
+        let storage = <USQStorage as QuantizerStorage>::try_from_batch(
+            batch,
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        (storage, encoded_rows, row_ids, code_bytes)
+    }
 
     #[tokio::test]
     async fn test_load_partition_projects_search_columns() {
@@ -393,5 +487,258 @@ mod tests {
         assert!(storage.batch.column_by_name(USQ_META_COLUMN).is_some());
         assert!(storage.batch.column_by_name(USQ_SIGN_COLUMN).is_none());
         assert!(storage.batch.column_by_name(CENTROID_DIST_COLUMN).is_none());
+    }
+
+    #[test]
+    fn try_from_batch_scores_identically_with_or_without_legacy_signs() {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2,
+                0.1,
+            ]),
+            8,
+        )
+        .unwrap();
+        let quantizer = USQuantizer::new(8, 4, 42);
+        let encoded = quantizer.transform(&vectors).unwrap();
+
+        let code_bytes = quantizer.code_bytes() as i32;
+        let row_ids = Arc::new(UInt64Array::from(vec![10_u64, 20_u64]));
+        let codes = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(encoded.packed_bits),
+                code_bytes,
+            )
+            .unwrap(),
+        );
+        let meta_values: Vec<f32> = encoded
+            .norms
+            .iter()
+            .zip(encoded.norms_sq.iter())
+            .zip(encoded.vmaxs.iter())
+            .zip(encoded.quant_qualities.iter())
+            .flat_map(|(((n, ns), vm), qq)| [*n, *ns, *vm, *qq])
+            .collect();
+        let meta = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(meta_values), 4).unwrap(),
+        );
+        let legacy_signs = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(vec![0_u8; vectors.len() * (quantizer.padded_dim() / 8)]),
+                (quantizer.padded_dim() / 8) as i32,
+            )
+            .unwrap(),
+        );
+
+        let schema_without_signs = Arc::new(ArrowSchema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                USQ_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    code_bytes,
+                ),
+                true,
+            ),
+            Field::new(
+                USQ_META_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+        let schema_with_signs = Arc::new(ArrowSchema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                USQ_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    code_bytes,
+                ),
+                true,
+            ),
+            Field::new(
+                USQ_SIGN_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    (quantizer.padded_dim() / 8) as i32,
+                ),
+                true,
+            ),
+            Field::new(
+                USQ_META_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let signless_batch = RecordBatch::try_new(
+            schema_without_signs,
+            vec![row_ids.clone(), codes.clone(), meta.clone()],
+        )
+        .unwrap();
+        let legacy_batch =
+            RecordBatch::try_new(schema_with_signs, vec![row_ids, codes, legacy_signs, meta])
+                .unwrap();
+
+        let metadata = UsqQuantizationMetadata {
+            dim: 8,
+            num_bits: 4,
+            rotation_seed: 42,
+        };
+        let signless_storage =
+            <USQStorage as QuantizerStorage>::try_from_batch(
+                signless_batch,
+                &metadata,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap();
+        let legacy_storage =
+            <USQStorage as QuantizerStorage>::try_from_batch(
+                legacy_batch,
+                &metadata,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap();
+
+        let query = Arc::new(Float32Array::from(vec![
+            0.15_f32, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85,
+        ]));
+        let signless_calc = signless_storage.dist_calculator(query.clone(), 0.0);
+        let legacy_calc = legacy_storage.dist_calculator(query, 0.0);
+
+        for id in 0..vectors.len() as u32 {
+            let signless_distance = signless_calc.distance(id);
+            let legacy_distance = legacy_calc.distance(id);
+            assert!(
+                (signless_distance - legacy_distance).abs() < 1e-5,
+                "distance mismatch at row {id}: signless={} legacy={}",
+                signless_distance,
+                legacy_distance
+            );
+        }
+    }
+
+    #[test]
+    fn signless_storage_preserves_hanns_score_ordering() {
+        let raw_vectors = vec![
+            vec![0.10_f32, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80],
+            vec![0.82_f32, 0.72, 0.62, 0.52, 0.42, 0.32, 0.22, 0.12],
+            vec![0.30_f32, 0.10, 0.60, 0.20, 0.90, 0.40, 0.80, 0.50],
+            vec![0.95_f32, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75],
+        ];
+        let (storage, encoded_rows, _row_ids, code_bytes) = build_signless_storage(&raw_vectors, 4);
+
+        let query = vec![0.18_f32, 0.28, 0.38, 0.48, 0.58, 0.68, 0.78, 0.88];
+        let query_arr = Arc::new(Float32Array::from(query.clone()));
+        let storage_calc = storage.dist_calculator(query_arr, 0.0);
+
+        let hanns_config = hanns::quantization::usq::UsqConfig::new(8, 4)
+            .unwrap()
+            .with_seed(42);
+        let hanns_quantizer = hanns::quantization::usq::UsqQuantizer::new(hanns_config);
+        let query_state = hanns_quantizer.precompute_query_state(&query);
+        let query_norm_sq: f32 = query.iter().map(|v| v * v).sum();
+
+        let mut expected_order: Vec<(usize, f32)> = raw_vectors
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let (norm, norm_sq, vmax, qq) = encoded_rows[idx];
+                let row_codes =
+                    &storage.codes.values().as_primitive::<arrow::datatypes::UInt8Type>().values()
+                        [idx * code_bytes..(idx + 1) * code_bytes];
+                let score =
+                    hanns_quantizer.score_with_meta(&query_state, norm, vmax, qq, row_codes);
+                let distance = query_norm_sq + norm_sq - 2.0 * score;
+                (idx, distance)
+            })
+            .collect();
+        expected_order.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        let mut storage_order: Vec<(usize, f32)> = (0..raw_vectors.len())
+            .map(|idx| (idx, storage_calc.distance(idx as u32)))
+            .collect();
+        storage_order.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        assert_eq!(
+            storage_order
+                .iter()
+                .map(|(idx, _)| idx)
+                .collect::<Vec<_>>(),
+            expected_order
+                .iter()
+                .map(|(idx, _)| idx)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn signless_storage_preserves_topk_against_hanns_reference() {
+        let raw_vectors = vec![
+            vec![0.05_f32, 0.12, 0.18, 0.21, 0.29, 0.33, 0.41, 0.52],
+            vec![0.90_f32, 0.82, 0.72, 0.61, 0.52, 0.40, 0.28, 0.14],
+            vec![0.21_f32, 0.45, 0.11, 0.67, 0.30, 0.74, 0.28, 0.61],
+            vec![0.88_f32, 0.10, 0.22, 0.35, 0.49, 0.58, 0.69, 0.80],
+            vec![0.17_f32, 0.24, 0.39, 0.43, 0.57, 0.68, 0.79, 0.91],
+            vec![0.63_f32, 0.55, 0.47, 0.38, 0.26, 0.19, 0.08, 0.03],
+        ];
+        let (storage, encoded_rows, row_ids, code_bytes) = build_signless_storage(&raw_vectors, 4);
+
+        let queries = vec![
+            vec![0.10_f32, 0.18, 0.25, 0.30, 0.41, 0.49, 0.58, 0.67],
+            vec![0.91_f32, 0.79, 0.71, 0.59, 0.48, 0.37, 0.25, 0.11],
+            vec![0.26_f32, 0.41, 0.16, 0.59, 0.34, 0.69, 0.31, 0.55],
+        ];
+        let top_k = 3;
+        let hanns_quantizer = hanns::quantization::usq::UsqQuantizer::new(
+            hanns::quantization::usq::UsqConfig::new(8, 4)
+                .unwrap()
+                .with_seed(42),
+        );
+
+        for query in queries {
+            let storage_calc =
+                storage.dist_calculator(Arc::new(Float32Array::from(query.clone())), 0.0);
+            let query_state = hanns_quantizer.precompute_query_state(&query);
+            let query_norm_sq: f32 = query.iter().map(|v| v * v).sum();
+
+            let mut expected_topk: Vec<(u64, f32)> = row_ids
+                .iter()
+                .enumerate()
+                .map(|(idx, row_id)| {
+                    let (norm, norm_sq, vmax, qq) = encoded_rows[idx];
+                    let row_codes =
+                        &storage.codes.values().as_primitive::<arrow::datatypes::UInt8Type>().values()
+                            [idx * code_bytes..(idx + 1) * code_bytes];
+                    let score =
+                        hanns_quantizer.score_with_meta(&query_state, norm, vmax, qq, row_codes);
+                    let distance = query_norm_sq + norm_sq - 2.0 * score;
+                    (*row_id, distance)
+                })
+                .collect();
+            expected_topk.sort_by(|a, b| a.1.total_cmp(&b.1));
+            expected_topk.truncate(top_k);
+
+            let mut storage_topk: Vec<(u64, f32)> = row_ids
+                .iter()
+                .enumerate()
+                .map(|(idx, row_id)| (*row_id, storage_calc.distance(idx as u32)))
+                .collect();
+            storage_topk.sort_by(|a, b| a.1.total_cmp(&b.1));
+            storage_topk.truncate(top_k);
+
+            assert_eq!(
+                storage_topk
+                    .iter()
+                    .map(|(row_id, _)| row_id)
+                    .collect::<Vec<_>>(),
+                expected_topk
+                    .iter()
+                    .map(|(row_id, _)| row_id)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

@@ -51,6 +51,7 @@ import argparse
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -89,6 +90,116 @@ def summarize_latency(samples_ms: list[float]) -> dict[str, float]:
 
 def parse_int_list(raw: str) -> list[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+PLAN_NODE_RE = re.compile(r"^(?P<indent>\s*)(?P<node>[A-Za-z][A-Za-z0-9_]*)\s*:(?P<rest>.*)$")
+KEY_VALUE_RE = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\d+(?:\.\d+)?)(?P<unit>ms|µs|us|s)?"
+)
+APPROXIMATE_STAGE_NODES = {"ANNSubIndex", "ANNIvfPartition"}
+REFINE_STAGE_NODES = {"KNNVectorDistance", "TakeExec", "Take"}
+READ_STAGE_NODES = {"LanceRead"}
+
+
+def _convert_metric_value(value: str, unit: str | None) -> float:
+    numeric = float(value)
+    if unit in (None, ""):
+        return numeric
+    if unit == "s":
+        return numeric * 1000.0
+    if unit in ("us", "µs"):
+        return numeric / 1000.0
+    if unit == "ms":
+        return numeric
+    raise ValueError(f"Unsupported metric unit: {unit}")
+
+
+def _parse_plan_node(line: str) -> dict | None:
+    match = PLAN_NODE_RE.match(line)
+    if match is None:
+        return None
+
+    metrics: dict[str, float] = {}
+    for kv_match in KEY_VALUE_RE.finditer(match.group("rest")):
+        key = kv_match.group("key")
+        value = _convert_metric_value(kv_match.group("value"), kv_match.group("unit"))
+        metrics[key] = value
+
+    elapsed_ms = metrics.get("elapsed")
+    if elapsed_ms is not None:
+        metrics["elapsed_ms"] = elapsed_ms
+
+    return {
+        "depth": len(match.group("indent")) // 2,
+        "node_type": match.group("node"),
+        "elapsed_ms": elapsed_ms,
+        "metrics": metrics,
+        "line": line.rstrip(),
+    }
+
+
+def parse_analyze_plan(plan_text: str) -> dict:
+    """Parse scanner.analyze_plan() output into node metrics and node-family aggregates.
+
+    The printed ``elapsed=...`` values come from subtree wall-clock ranges in
+    ``lance_datafusion::format_plan``. Summing parent and child nodes therefore
+    double-counts time. The returned ``approximate_stage`` / ``refine_stage``
+    summaries should be read as node-family elapsed aggregations, not
+    mutually-exclusive stage timings.
+    """
+    nodes = []
+    for line in plan_text.splitlines():
+        node = _parse_plan_node(line)
+        if node is not None:
+            nodes.append(node)
+
+    def summarize_stage(node_types: set[str]) -> dict[str, float | int]:
+        matching = [node for node in nodes if node["node_type"] in node_types]
+        summary: dict[str, float | int] = {
+            "node_count": len(matching),
+            "elapsed_ms": sum((node["elapsed_ms"] or 0.0) for node in matching),
+        }
+        for metric_name in ("bytes_read", "iops", "requests", "task_wait_time"):
+            summary[metric_name] = sum(
+                node["metrics"].get(metric_name, 0.0) for node in matching
+            )
+        return summary
+
+    return {
+        "node_metrics": nodes,
+        "summary": {
+            "approximate_stage": summarize_stage(APPROXIMATE_STAGE_NODES),
+            "refine_stage": summarize_stage(REFINE_STAGE_NODES),
+            "read_stage": summarize_stage(READ_STAGE_NODES),
+        },
+    }
+
+
+def analyze_query_plan(
+    dataset,
+    *,
+    column: str,
+    qvec,
+    top_k: int,
+    metric: str,
+    nprobes: int,
+    refine_factor: int,
+) -> dict:
+    scanner = dataset.scanner(
+        columns=["_distance"],
+        nearest=make_nearest_kwargs(
+            column=column,
+            qvec=qvec,
+            top_k=top_k,
+            metric=metric,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+        ),
+    )
+    plan_text = scanner.analyze_plan()
+    parsed = parse_analyze_plan(plan_text)
+    parsed["raw_plan"] = plan_text
+    return parsed
 
 
 def compute_recall_at_k(
@@ -680,6 +791,39 @@ def cmd_query(args):
     result["refine_factor"] = refine_factor
     result["top_k"] = top_k
 
+    if getattr(args, "analyze_plan", False):
+        plan_query_index = warmup if warmup < len(query_vectors) else 0
+        print("\nCollecting analyze_plan metrics"
+              f"{' on shard-0' if plan == 'B' else ''}"
+              f" using query index {plan_query_index}...")
+        plan_metrics = analyze_query_plan(
+            datasets[0],
+            column=column,
+            qvec=query_vectors[plan_query_index],
+            top_k=top_k,
+            metric=metric,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+        )
+        plan_metrics["scope"] = (
+            "single-shard Lance scanner plan on shard-0; distributed merge is not included"
+            if plan == "B"
+            else "single-dataset Lance scanner plan"
+        )
+        result["plan_metrics"] = plan_metrics
+
+        approx = plan_metrics["summary"]["approximate_stage"]
+        refine = plan_metrics["summary"]["refine_stage"]
+        reads = plan_metrics["summary"]["read_stage"]
+        print("  analyze_plan summary:")
+        print(f"    Approximate stage: {approx['node_count']} nodes, "
+              f"{approx['elapsed_ms']:.1f}ms elapsed")
+        print(f"    Refine stage:      {refine['node_count']} nodes, "
+              f"{refine['elapsed_ms']:.1f}ms elapsed")
+        print(f"    Read stage:        {reads['node_count']} nodes, "
+              f"bytes_read={reads['bytes_read']:.0f}, "
+              f"iops={reads['iops']:.0f}, requests={reads['requests']:.0f}")
+
     # Compute recall if requested
     recall_k = getattr(args, "recall_k", None)
     gt_path = getattr(args, "gt_path", None)
@@ -881,6 +1025,9 @@ def add_query_args(p: argparse.ArgumentParser):
     p.add_argument("--gt-path", default=None,
                    help="Pre-computed GT .npz with positional indices (skips GT generation, "
                         "enables cross-dataset recall e.g. PCA vs original vectors)")
+    p.add_argument("--analyze-plan", action="store_true",
+                   help="Run scanner.analyze_plan() for one representative query and attach "
+                        "parsed stage metrics to the result JSON")
 
     # Data source (at least one required depending on plan)
     p.add_argument("--dataset-uri", default=None,

@@ -3473,14 +3473,9 @@ fn prepare_vector_index_params(
             m_type, ivf_params, rq_params,
         ))),
 
-        #[cfg(feature = "hanns")]
         "IVF_USQ" => Ok(Box::new(VectorIndexParams::with_ivf_usq_params(
             m_type, ivf_params, usq_params,
         ))),
-        #[cfg(not(feature = "hanns"))]
-        "IVF_USQ" => Err(PyValueError::new_err(
-            "IVF_USQ index type requires the 'hanns' feature to be enabled.".to_string(),
-        )),
 
         "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
             m_type,

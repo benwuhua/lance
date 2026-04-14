@@ -9,6 +9,8 @@ date: 2026-04-11
 
 Test IVF_USQ (4-bit Ultra-Sparse Quantization via Hanns) on PCA-512 data as a potential replacement for IVF_RQ. USQ uses random rotation + 4-bit quantization with Hanns approximate scoring.
 
+> Methodology note: this page preserves the earlier `5-query / warmup=0 / _rowid GT` experimental slice. The canonical cross-family comparison now lives in [pca512-usq-revalidation.md](pca512-usq-revalidation.md) and uses the unified legacy contract (`query_count=8`, `warmup=3`, positional GT).
+
 ## Setup
 
 - **Dataset**: Same PCA-512 vectors, 5 shards x 194M rows, 512-dim, cosine metric

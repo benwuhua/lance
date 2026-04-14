@@ -9,6 +9,8 @@ date: 2026-04-11
 
 Test IVF_USQ with 8-bit quantization on PCA-512 data to fill the recall 0.81-0.96 gap identified in the OBS Pareto frontier. USQ 4-bit rf=1 covers recall ≤0.81, SQ rf=1 covers ~0.96. USQ 8-bit should deliver 0.95+ recall at rf=1.
 
+> Methodology note: this page preserves the earlier `5-query / warmup=0 / _rowid GT` and the 2026-04-12 OBS refresh slice. The canonical cross-family comparison now lives in [pca512-usq-revalidation.md](pca512-usq-revalidation.md) and uses the unified legacy contract (`query_count=8`, `warmup=3`, positional GT).
+
 2026-04-12 refresh: reran the OBS sweep on ECS `knowledge-ecs-44c3` with the same 5-query GT and seed. DRAM / SSD numbers below remain from the original 2026-04-11 run; only the OBS table and Pareto conclusions were refreshed.
 
 ## Setup
