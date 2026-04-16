@@ -890,6 +890,7 @@ impl FileFragment {
             self.count_rows(None).await?,
             num_physical_rows,
             Arc::new(self.metadata.clone()),
+            self.dataset.object_store().io_parallelism(),
         )?;
 
         if read_config.with_row_id {
@@ -1944,6 +1945,10 @@ pub struct FragmentReader {
 
     // total number of physical rows in the fragment (all rows, ignoring deletions)
     num_physical_rows: usize,
+
+    /// I/O parallelism hint from the underlying object store, used to size
+    /// producer-side buffering for take operations.
+    io_parallelism: usize,
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -1972,6 +1977,7 @@ impl Clone for FragmentReader {
             created_at_sequence: self.created_at_sequence.clone(),
             num_rows: self.num_rows,
             num_physical_rows: self.num_physical_rows,
+            io_parallelism: self.io_parallelism,
         }
     }
 }
@@ -2007,6 +2013,7 @@ impl FragmentReader {
         num_rows: usize,
         num_physical_rows: usize,
         fragment: Arc<Fragment>,
+        io_parallelism: usize,
     ) -> Result<Self> {
         if let Some(legacy_reader) = readers.first().and_then(|reader| reader.as_legacy_opt()) {
             let num_batches = legacy_reader.num_batches();
@@ -2039,6 +2046,7 @@ impl FragmentReader {
             created_at_sequence: None,
             num_rows,
             num_physical_rows,
+            io_parallelism,
         })
     }
 
@@ -2554,7 +2562,10 @@ impl FragmentReader {
                 range.start as u32..range.end as u32,
                 DEFAULT_BATCH_READ_SIZE,
             )?
-            .buffered(get_num_compute_intensive_cpus())
+            .buffered(std::cmp::max(
+                self.io_parallelism,
+                get_num_compute_intensive_cpus(),
+            ))
             .try_collect::<Vec<_>>()
             .await?;
         concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
@@ -2611,7 +2622,10 @@ impl FragmentReader {
         let batches = self
             .take(&unique_indices, u32::MAX, take_priority)
             .await?
-            .buffered(get_num_compute_intensive_cpus())
+            .buffered(std::cmp::max(
+                self.io_parallelism,
+                get_num_compute_intensive_cpus(),
+            ))
             .try_collect::<Vec<_>>()
             .await?;
         let mut batch = concat_batches(&Arc::new(self.output_schema.clone()), batches.iter())?;

@@ -27,7 +27,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use std::cmp::max;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use tracing::error;
@@ -366,6 +366,7 @@ impl TakeStream {
     ) -> impl Stream<Item = Result<RecordBatch>> {
         let scan_scheduler = self.scan_scheduler.clone();
         let metrics = self.metrics.clone();
+        let io_parallelism = self.dataset.object_store().io_parallelism();
         let batches = input
             .enumerate()
             .map(move |(batch_index, batch)| {
@@ -379,7 +380,10 @@ impl TakeStream {
             .boxed();
         batches
             .inspect_ok(move |_| metrics.io_metrics.record(&scan_scheduler))
-            .try_buffered(get_num_compute_intensive_cpus())
+            .try_buffered(max(
+                io_parallelism,
+                lance_core::utils::tokio::get_num_compute_intensive_cpus(),
+            ))
     }
 }
 

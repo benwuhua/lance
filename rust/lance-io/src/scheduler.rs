@@ -602,9 +602,14 @@ impl ScanScheduler {
             .await?;
         let block_size = self.object_store.block_size() as u64;
         let max_iop_size = self.object_store.max_iop_size();
+        let coalesce_gap = std::env::var("LANCE_COALESCE_GAP")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(block_size);
         Ok(FileScheduler {
             reader: reader.into(),
             block_size,
+            coalesce_gap,
             root: self.clone(),
             base_priority,
             max_iop_size,
@@ -771,6 +776,10 @@ pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<ScanScheduler>,
     block_size: u64,
+    /// Maximum gap between two byte ranges that will be coalesced into a
+    /// single I/O request.  Defaults to `block_size` but can be overridden
+    /// via the `LANCE_COALESCE_GAP` environment variable (in bytes).
+    coalesce_gap: u64,
     base_priority: u64,
     max_iop_size: u64,
 }
@@ -811,7 +820,7 @@ impl FileScheduler {
             let mut curr_interval = request[0].clone();
 
             for req in request.iter().skip(1) {
-                if is_close_together(&curr_interval, req, self.block_size) {
+                if is_close_together(&curr_interval, req, self.coalesce_gap) {
                     curr_interval.end = curr_interval.end.max(req.end);
                 } else {
                     merged_requests.push(curr_interval);
@@ -902,6 +911,7 @@ impl FileScheduler {
             reader: self.reader.clone(),
             root: self.root.clone(),
             block_size: self.block_size,
+            coalesce_gap: self.coalesce_gap,
             max_iop_size: self.max_iop_size,
             base_priority: priority,
         }
@@ -929,6 +939,13 @@ impl FileScheduler {
     /// which either aren't IOPS or we don't throttle
     pub fn reader(&self) -> &Arc<dyn Reader> {
         &self.reader
+    }
+
+    /// Returns the I/O parallelism suggested by the underlying reader / storage device.
+    ///
+    /// Useful for sizing producer-side concurrency to match I/O scheduler capacity.
+    pub fn io_parallelism(&self) -> usize {
+        self.reader.io_parallelism()
     }
 }
 
