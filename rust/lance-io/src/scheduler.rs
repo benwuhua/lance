@@ -608,7 +608,6 @@ impl ScanScheduler {
             .unwrap_or(block_size);
         Ok(FileScheduler {
             reader: reader.into(),
-            block_size,
             coalesce_gap,
             root: self.clone(),
             base_priority,
@@ -775,7 +774,6 @@ impl Drop for ScanScheduler {
 pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<ScanScheduler>,
-    block_size: u64,
     /// Maximum gap between two byte ranges that will be coalesced into a
     /// single I/O request.  Defaults to `block_size` but can be overridden
     /// via the `LANCE_COALESCE_GAP` environment variable (in bytes).
@@ -784,9 +782,9 @@ pub struct FileScheduler {
     max_iop_size: u64,
 }
 
-fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
+fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, gap: u64) -> bool {
     // Note that range1.end <= range2.start is possible (e.g. when decoding string arrays)
-    range2.start <= (range1.end + block_size)
+    range2.start <= (range1.end + gap)
 }
 
 fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
@@ -910,7 +908,6 @@ impl FileScheduler {
         Self {
             reader: self.reader.clone(),
             root: self.root.clone(),
-            block_size: self.block_size,
             coalesce_gap: self.coalesce_gap,
             max_iop_size: self.max_iop_size,
             base_priority: priority,
