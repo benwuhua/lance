@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use futures::StreamExt;
 use futures::prelude::stream::{self, TryStreamExt};
-use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
@@ -349,9 +349,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     async fn prewarm(&self) -> Result<()> {
         futures::stream::iter(0..self.ivf.num_partitions())
             .map(Ok)
-            .try_for_each_concurrent(Some(self.io_parallelism), |part_id| {
-                self.load_partition(part_id, true, &NoOpMetricsCollector)
-                    .map_ok(|_| ())
+            .try_for_each_concurrent(Some(self.io_parallelism), |part_id| async move {
+                let part_entry = self
+                    .load_partition(part_id, true, &NoOpMetricsCollector)
+                    .await?;
+                let part = part_entry
+                    .as_any()
+                    .downcast_ref::<PartitionEntry<S, Q>>()
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "unexpected IVF partition cache entry type for partition {}",
+                            part_id
+                        ))
+                    })?;
+                part.index.prewarm()
             })
             .await
     }

@@ -463,6 +463,10 @@ impl IvfSubIndex for HannsHnswIndex {
         Self::load_from_parts(serialized, &metadata)
     }
 
+    fn prewarm(&self) -> Result<()> {
+        self.runtime_index().map(|_| ())
+    }
+
     fn name() -> &'static str {
         HANNS_HNSW_TYPE
     }
@@ -993,6 +997,41 @@ mod tests {
         assert_eq!(
             first_results, second_results,
             "caching should not change Hanns search results"
+        );
+    }
+
+    #[test]
+    fn test_hanns_runtime_cache_prewarm() {
+        let dim = 32;
+        let num_vectors = 100;
+        let vectors = random_vectors(num_vectors, dim, 4567);
+
+        let params = HannsHnswBuildParams::new(16, 200);
+        let original = build_test_index(&vectors, dim, DistanceType::L2, &params, num_vectors);
+        let loaded = HannsHnswIndex::load(original.to_batch().unwrap()).unwrap();
+
+        assert!(
+            !loaded.is_runtime_cache_initialized(),
+            "loaded index should start with an empty runtime cache"
+        );
+
+        loaded.prewarm().unwrap();
+        assert!(
+            loaded.is_runtime_cache_initialized(),
+            "prewarm should initialize the Hanns runtime cache"
+        );
+        let first_cache_ptr = loaded
+            .runtime_cache_ptr()
+            .expect("runtime cache should be initialized after prewarm");
+
+        loaded.prewarm().unwrap();
+        let second_cache_ptr = loaded
+            .runtime_cache_ptr()
+            .expect("runtime cache should remain initialized after second prewarm");
+
+        assert_eq!(
+            first_cache_ptr, second_cache_ptr,
+            "second prewarm should reuse the cached Hanns runtime"
         );
     }
 
