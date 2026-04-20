@@ -353,16 +353,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
                 let part_entry = self
                     .load_partition(part_id, true, &NoOpMetricsCollector)
                     .await?;
-                let part = part_entry
-                    .as_any()
-                    .downcast_ref::<PartitionEntry<S, Q>>()
-                    .ok_or_else(|| {
-                        Error::index(format!(
-                            "unexpected IVF partition cache entry type for partition {}",
-                            part_id
-                        ))
-                    })?;
-                part.index.prewarm()
+                spawn_cpu(move || {
+                    let part = part_entry
+                        .as_any()
+                        .downcast_ref::<PartitionEntry<S, Q>>()
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "failed to downcast IVF partition cache entry for prewarm partition {}",
+                                part_id
+                            ))
+                        })?;
+                    part.index.prewarm()
+                })
+                .await?;
+                Ok(())
             })
             .await
     }

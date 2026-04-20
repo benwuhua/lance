@@ -464,6 +464,10 @@ impl IvfSubIndex for HannsHnswIndex {
     }
 
     fn prewarm(&self) -> Result<()> {
+        if self.node_to_rowid.is_empty() && self.serialized.is_empty() {
+            return Ok(());
+        }
+
         self.runtime_index().map(|_| ())
     }
 
@@ -1032,6 +1036,23 @@ mod tests {
         assert_eq!(
             first_cache_ptr, second_cache_ptr,
             "second prewarm should reuse the cached Hanns runtime"
+        );
+    }
+
+    #[test]
+    fn test_hanns_runtime_cache_prewarm_empty_index() {
+        let loaded = HannsHnswIndex::load(RecordBatch::new_empty(HannsHnswIndex::schema()))
+            .expect("empty Hanns index should load");
+
+        assert!(
+            !loaded.is_runtime_cache_initialized(),
+            "empty index should start with an empty runtime cache"
+        );
+
+        loaded.prewarm().expect("empty prewarm should be a no-op");
+        assert!(
+            !loaded.is_runtime_cache_initialized(),
+            "empty prewarm should not initialize the runtime cache"
         );
     }
 
