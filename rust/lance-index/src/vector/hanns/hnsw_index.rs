@@ -252,11 +252,45 @@ impl HannsHnswIndex {
     }
 
     fn candidate_k_for_prefilter(k: usize, prefilter_is_empty: bool, index_len: usize) -> usize {
-        if prefilter_is_empty || k == 0 {
+        if prefilter_is_empty {
             k
         } else {
-            index_len.max(k)
+            k.min(index_len)
         }
+    }
+
+    fn grow_candidate_k(candidate_k: usize, index_len: usize) -> usize {
+        candidate_k.saturating_mul(2).min(index_len)
+    }
+
+    fn map_and_filter_results(
+        results: &[(usize, f32)],
+        node_to_rowid: &[u64],
+        k: usize,
+        mut is_selected: impl FnMut(u64) -> bool,
+    ) -> (Vec<u64>, Vec<f32>) {
+        if k == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut row_ids = Vec::with_capacity(results.len().min(k));
+        let mut distances = Vec::with_capacity(results.len().min(k));
+
+        for (node_idx, dist) in results {
+            let rowid = node_to_rowid
+                .get(*node_idx)
+                .copied()
+                .unwrap_or(*node_idx as u64);
+            if is_selected(rowid) {
+                row_ids.push(rowid);
+                distances.push(*dist);
+                if row_ids.len() == k {
+                    break;
+                }
+            }
+        }
+
+        (row_ids, distances)
     }
 
     /// Build a Hanns HNSW index from raw f32 vectors.
@@ -460,45 +494,32 @@ impl IvfSubIndex for HannsHnswIndex {
         let query_arr = query.as_primitive::<arrow::datatypes::Float32Type>();
         let query_slice = query_arr.values();
         let prefilter_is_empty = prefilter.is_empty();
-        let candidate_k =
-            Self::candidate_k_for_prefilter(k, prefilter_is_empty, self.node_to_rowid.len());
 
-        // Determine effective ef_search.
-        let ef = params.ef.max(candidate_k);
-
-        let results = self.search_hanns(query_slice, candidate_k, ef)?;
-
-        // Apply prefilter: map Hanns node IDs to Lance row IDs and filter.
-        let mut row_ids = Vec::with_capacity(results.len().min(k));
-        let mut distances = Vec::with_capacity(results.len().min(k));
-
-        if prefilter_is_empty {
-            for (node_idx, dist) in &results {
-                let rowid = self
-                    .node_to_rowid
-                    .get(*node_idx)
-                    .copied()
-                    .unwrap_or(*node_idx as u64);
-                row_ids.push(rowid);
-                distances.push(*dist);
-            }
+        let (row_ids, distances) = if prefilter_is_empty {
+            let candidate_k = Self::candidate_k_for_prefilter(k, true, self.node_to_rowid.len());
+            let ef = params.ef.max(candidate_k);
+            let results = self.search_hanns(query_slice, candidate_k, ef)?;
+            Self::map_and_filter_results(&results, &self.node_to_rowid, k, |_| true)
         } else {
             let mask = prefilter.mask();
-            for (node_idx, dist) in &results {
-                let rowid = self
-                    .node_to_rowid
-                    .get(*node_idx)
-                    .copied()
-                    .unwrap_or(*node_idx as u64);
-                if mask.selected(rowid) {
-                    row_ids.push(rowid);
-                    distances.push(*dist);
-                    if row_ids.len() == k {
-                        break;
-                    }
+            let index_len = self.node_to_rowid.len();
+            let mut candidate_k = Self::candidate_k_for_prefilter(k, false, index_len);
+
+            loop {
+                let ef = params.ef.max(candidate_k);
+                let results = self.search_hanns(query_slice, candidate_k, ef)?;
+                let filtered =
+                    Self::map_and_filter_results(&results, &self.node_to_rowid, k, |rowid| {
+                        mask.selected(rowid)
+                    });
+
+                if filtered.0.len() == k || candidate_k >= index_len {
+                    break filtered;
                 }
+
+                candidate_k = Self::grow_candidate_k(candidate_k, index_len);
             }
-        }
+        };
 
         metrics.record_comparisons(self.node_to_rowid.len());
 
@@ -666,11 +687,34 @@ mod tests {
         params: &HannsHnswBuildParams,
         num_vectors: usize,
     ) -> HannsHnswIndex {
+        build_test_index_with_rowids(
+            vectors,
+            dim,
+            metric_type,
+            params,
+            (0..num_vectors).map(|i| i as u64).collect(),
+        )
+    }
+
+    fn build_test_index_with_rowids(
+        vectors: &[f32],
+        dim: usize,
+        metric_type: DistanceType,
+        params: &HannsHnswBuildParams,
+        row_ids: Vec<u64>,
+    ) -> HannsHnswIndex {
         let mut index =
             HannsHnswIndex::build_from_vectors(vectors, dim, metric_type, params).unwrap();
-        // Set identity mapping: node i -> row id i.
-        index.node_to_rowid = (0..num_vectors).map(|i| i as u64).collect();
+        index.node_to_rowid = row_ids;
         index
+    }
+
+    #[test]
+    fn test_filtered_candidate_k_starts_at_requested_k() {
+        assert_eq!(
+            HannsHnswIndex::candidate_k_for_prefilter(10, false, 1_000),
+            10
+        );
     }
 
     #[test]
@@ -716,6 +760,84 @@ mod tests {
         );
         let row_ids = batch[ROW_ID_FIELD.name()].as_primitive::<arrow::datatypes::UInt64Type>();
         assert_eq!(row_ids.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_filtered_search_uses_mapped_row_ids() {
+        let dim = 2;
+        let k = 2;
+        let vectors = vec![
+            0.0, 0.0, //
+            0.1, 0.0, //
+            0.2, 0.0, //
+        ];
+        let mapped_row_ids = vec![100, 7, 42];
+        let query = Arc::new(Float32Array::from(vec![0.0, 0.0])) as ArrayRef;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            Arc::new(Float32Array::from(vectors.clone())) as ArrayRef,
+            dim as i32,
+        )
+        .unwrap();
+        let storage = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HannsHnswBuildParams::new(2, 32);
+        let index =
+            build_test_index_with_rowids(&vectors, dim, DistanceType::L2, &params, mapped_row_ids);
+
+        let batch = index
+            .search(
+                query,
+                k,
+                HannsHnswQueryParams { ef: k },
+                &storage,
+                Arc::new(TestPreFilter::allow([7, 42])),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        let row_ids = batch[ROW_ID_FIELD.name()].as_primitive::<arrow::datatypes::UInt64Type>();
+        assert_eq!(row_ids.values(), &[7, 42]);
+    }
+
+    #[test]
+    fn test_filtered_search_truncates_output_to_k() {
+        let dim = 2;
+        let k = 2;
+        let vectors = vec![
+            0.0, 0.0, //
+            0.1, 0.0, //
+            0.2, 0.0, //
+            0.3, 0.0, //
+        ];
+        let query = Arc::new(Float32Array::from(vec![0.0, 0.0])) as ArrayRef;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            Arc::new(Float32Array::from(vectors.clone())) as ArrayRef,
+            dim as i32,
+        )
+        .unwrap();
+        let storage = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HannsHnswBuildParams::new(2, 32);
+        let index = build_test_index(
+            &vectors,
+            dim,
+            DistanceType::L2,
+            &params,
+            vectors.len() / dim,
+        );
+
+        let batch = index
+            .search(
+                query,
+                k,
+                HannsHnswQueryParams { ef: k },
+                &storage,
+                Arc::new(TestPreFilter::allow([0, 1, 2, 3])),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), k);
+        let row_ids = batch[ROW_ID_FIELD.name()].as_primitive::<arrow::datatypes::UInt64Type>();
+        assert!(row_ids.values().iter().all(|row_id| *row_id < 4));
     }
 
     #[test]
