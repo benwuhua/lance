@@ -251,6 +251,14 @@ impl HannsHnswIndex {
             .map(|index| index as *const hanns::HnswIndex)
     }
 
+    fn candidate_k_for_prefilter(k: usize, prefilter_is_empty: bool, index_len: usize) -> usize {
+        if prefilter_is_empty || k == 0 {
+            k
+        } else {
+            index_len.max(k)
+        }
+    }
+
     /// Build a Hanns HNSW index from raw f32 vectors.
     fn build_from_vectors(
         vectors: &[f32],
@@ -451,17 +459,20 @@ impl IvfSubIndex for HannsHnswIndex {
         // Convert query to flat f32 slice.
         let query_arr = query.as_primitive::<arrow::datatypes::Float32Type>();
         let query_slice = query_arr.values();
+        let prefilter_is_empty = prefilter.is_empty();
+        let candidate_k =
+            Self::candidate_k_for_prefilter(k, prefilter_is_empty, self.node_to_rowid.len());
 
         // Determine effective ef_search.
-        let ef = params.ef.max(k);
+        let ef = params.ef.max(candidate_k);
 
-        let results = self.search_hanns(query_slice, k, ef)?;
+        let results = self.search_hanns(query_slice, candidate_k, ef)?;
 
         // Apply prefilter: map Hanns node IDs to Lance row IDs and filter.
-        let mut row_ids = Vec::with_capacity(results.len());
-        let mut distances = Vec::with_capacity(results.len());
+        let mut row_ids = Vec::with_capacity(results.len().min(k));
+        let mut distances = Vec::with_capacity(results.len().min(k));
 
-        if prefilter.is_empty() {
+        if prefilter_is_empty {
             for (node_idx, dist) in &results {
                 let rowid = self
                     .node_to_rowid
@@ -482,6 +493,9 @@ impl IvfSubIndex for HannsHnswIndex {
                 if mask.selected(rowid) {
                     row_ids.push(rowid);
                     distances.push(*dist);
+                    if row_ids.len() == k {
+                        break;
+                    }
                 }
             }
         }
@@ -592,9 +606,50 @@ impl IvfSubIndex for HannsHnswIndex {
 #[cfg(feature = "hanns")]
 mod tests {
     use super::*;
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::vector::flat::storage::FlatFloatStorage;
+    use arrow_array::FixedSizeListArray;
+    use async_trait::async_trait;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
     use lance_linalg::distance::DistanceType;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+
+    struct TestPreFilter {
+        mask: Arc<RowAddrMask>,
+    }
+
+    impl TestPreFilter {
+        fn allow(row_ids: impl IntoIterator<Item = u64>) -> Self {
+            let mut allowed = RowAddrTreeMap::new();
+            for row_id in row_ids {
+                allowed.insert(row_id);
+            }
+            Self {
+                mask: Arc::new(RowAddrMask::from_allowed(allowed)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PreFilter for TestPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<RowAddrMask> {
+            Arc::clone(&self.mask)
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
+        }
+    }
 
     fn random_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut rng = StdRng::seed_from_u64(seed);
@@ -616,6 +671,51 @@ mod tests {
         // Set identity mapping: node i -> row id i.
         index.node_to_rowid = (0..num_vectors).map(|i| i as u64).collect();
         index
+    }
+
+    #[test]
+    fn test_filtered_search_fills_k_from_deeper_candidates() {
+        let dim = 2;
+        let k = 2;
+        let vectors = vec![
+            0.0, 0.0, //
+            0.1, 0.0, //
+            0.2, 0.0, //
+        ];
+        let query = Arc::new(Float32Array::from(vec![0.0, 0.0])) as ArrayRef;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            Arc::new(Float32Array::from(vectors.clone())) as ArrayRef,
+            dim as i32,
+        )
+        .unwrap();
+        let storage = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HannsHnswBuildParams::new(2, 32);
+        let index = build_test_index(
+            &vectors,
+            dim,
+            DistanceType::L2,
+            &params,
+            vectors.len() / dim,
+        );
+
+        let batch = index
+            .search(
+                query,
+                k,
+                HannsHnswQueryParams { ef: k },
+                &storage,
+                Arc::new(TestPreFilter::allow([1, 2])),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch.num_rows(),
+            k,
+            "filtered Hanns HNSW search should keep looking past filtered top candidates"
+        );
+        let row_ids = batch[ROW_ID_FIELD.name()].as_primitive::<arrow::datatypes::UInt64Type>();
+        assert_eq!(row_ids.values(), &[1, 2]);
     }
 
     #[test]
