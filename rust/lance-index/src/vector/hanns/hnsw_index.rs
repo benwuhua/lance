@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use arrow::array::AsArray;
 use arrow_array::{ArrayRef, BinaryArray, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use deepsize::DeepSizeOf;
+use deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,47 @@ struct HannsMetadata {
     node_to_rowid: Vec<(u32, u64)>,
 }
 
+struct HannsRuntimeCache {
+    index: OnceLock<hanns::HnswIndex>,
+    initialized_size_estimate: usize,
+}
+
+impl HannsRuntimeCache {
+    fn new(serialized_size: usize) -> Self {
+        Self {
+            index: OnceLock::new(),
+            initialized_size_estimate: serialized_size,
+        }
+    }
+
+    fn from_index(index: hanns::HnswIndex, serialized_size: usize) -> Self {
+        Self {
+            index: OnceLock::from(index),
+            initialized_size_estimate: serialized_size,
+        }
+    }
+
+    fn get(&self) -> Option<&hanns::HnswIndex> {
+        self.index.get()
+    }
+
+    fn set(&self, index: hanns::HnswIndex) -> std::result::Result<(), hanns::HnswIndex> {
+        self.index.set(index)
+    }
+}
+
+impl DeepSizeOf for HannsRuntimeCache {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        if self.index.get().is_some() {
+            // Hanns does not expose deep-size accounting for its runtime graph,
+            // so use the persisted graph bytes as a conservative retained-size estimate.
+            self.initialized_size_estimate
+        } else {
+            0
+        }
+    }
+}
+
 /// Hanns HNSW index wrapper implementing IvfSubIndex.
 ///
 /// This wraps the Hanns HNSW implementation as a sub-index for Lance IVF.
@@ -102,7 +143,7 @@ pub struct HannsHnswIndex {
     /// Serialized graph bytes (kept for deep_size_of and remap).
     serialized: Vec<u8>,
     /// Runtime Hanns graph cache shared by clones.
-    runtime_cache: Arc<OnceLock<hanns::HnswIndex>>,
+    runtime_cache: Arc<HannsRuntimeCache>,
     /// Vector dimension.
     dim: usize,
     /// Distance type used for this index.
@@ -114,8 +155,9 @@ pub struct HannsHnswIndex {
 }
 
 impl DeepSizeOf for HannsHnswIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.serialized.deep_size_of_children(context)
+            + self.runtime_cache.deep_size_of_children(context)
             + self.dim.deep_size_of_children(context)
             + self.node_to_rowid.deep_size_of_children(context)
     }
@@ -215,10 +257,11 @@ impl HannsHnswIndex {
         let serialized = index.serialize_to_bytes().map_err(|e| {
             Error::index(format!("Hanns HnswIndex::serialize_to_bytes failed: {}", e))
         })?;
+        let serialized_size = serialized.len();
 
         Ok(Self {
             serialized,
-            runtime_cache: Arc::new(OnceLock::from(index)),
+            runtime_cache: Arc::new(HannsRuntimeCache::from_index(index, serialized_size)),
             dim,
             metric_type,
             build_params: params.clone(),
@@ -274,6 +317,7 @@ impl HannsHnswIndex {
 
     /// Load the index from serialized bytes and metadata.
     fn load_from_parts(serialized: Vec<u8>, metadata: &HannsMetadata) -> Result<Self> {
+        let serialized_size = serialized.len();
         let metric_type = match metadata.metric_type.as_str() {
             "l2" => DistanceType::L2,
             "cosine" => DistanceType::Cosine,
@@ -303,7 +347,7 @@ impl HannsHnswIndex {
 
         Ok(Self {
             serialized,
-            runtime_cache: Arc::new(OnceLock::new()),
+            runtime_cache: Arc::new(HannsRuntimeCache::new(serialized_size)),
             dim: metadata.dim,
             metric_type,
             build_params: metadata.build_params.clone(),
@@ -323,7 +367,7 @@ impl IvfSubIndex for HannsHnswIndex {
         if data.num_rows() == 0 {
             return Ok(Self {
                 serialized: Vec::new(),
-                runtime_cache: Arc::new(OnceLock::new()),
+                runtime_cache: Arc::new(HannsRuntimeCache::new(0)),
                 dim: 0,
                 metric_type: DistanceType::L2,
                 build_params: HannsHnswBuildParams::default(),
@@ -439,7 +483,7 @@ impl IvfSubIndex for HannsHnswIndex {
         if storage.is_empty() {
             return Ok(Self {
                 serialized: Vec::new(),
-                runtime_cache: Arc::new(OnceLock::new()),
+                runtime_cache: Arc::new(HannsRuntimeCache::new(0)),
                 dim: 0,
                 metric_type: storage.distance_type(),
                 build_params: params,
@@ -747,6 +791,35 @@ mod tests {
             loaded.runtime_cache_ptr(),
             cloned.runtime_cache_ptr(),
             "clone and original should share the same cached Hanns runtime"
+        );
+    }
+
+    #[test]
+    fn test_hanns_runtime_cache_deep_size() {
+        let dim = 32;
+        let num_vectors = 100;
+        let vectors = random_vectors(num_vectors, dim, 101112);
+
+        let params = HannsHnswBuildParams::new(16, 200);
+        let original = build_test_index(&vectors, dim, DistanceType::L2, &params, num_vectors);
+        let loaded = HannsHnswIndex::load(original.to_batch().unwrap()).unwrap();
+        let query = &vectors[0..dim];
+
+        assert!(
+            !loaded.is_runtime_cache_initialized(),
+            "loaded index should start with an empty runtime cache"
+        );
+
+        let before_search_size = loaded.deep_size_of();
+        loaded.search_hanns(query, 5, 400).unwrap();
+        let after_search_size = loaded.deep_size_of();
+
+        assert!(
+            after_search_size >= before_search_size + loaded.serialized.len(),
+            "deep size should increase by at least serialized graph bytes after runtime cache initializes: before={}, after={}, serialized={}",
+            before_search_size,
+            after_search_size,
+            loaded.serialized.len()
         );
     }
 
