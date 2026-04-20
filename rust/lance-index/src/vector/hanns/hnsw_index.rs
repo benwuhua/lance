@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use arrow::array::AsArray;
 use arrow_array::{ArrayRef, BinaryArray, Float32Array, RecordBatch, UInt64Array};
@@ -95,6 +95,7 @@ struct HannsMetadata {
 
 struct HannsRuntimeCache {
     index: OnceLock<hanns::HnswIndex>,
+    init_lock: Mutex<()>,
     initialized_size_estimate: usize,
 }
 
@@ -102,6 +103,7 @@ impl HannsRuntimeCache {
     fn new(serialized_size: usize) -> Self {
         Self {
             index: OnceLock::new(),
+            init_lock: Mutex::new(()),
             initialized_size_estimate: serialized_size,
         }
     }
@@ -109,6 +111,7 @@ impl HannsRuntimeCache {
     fn from_index(index: hanns::HnswIndex, serialized_size: usize) -> Self {
         Self {
             index: OnceLock::from(index),
+            init_lock: Mutex::new(()),
             initialized_size_estimate: serialized_size,
         }
     }
@@ -117,8 +120,29 @@ impl HannsRuntimeCache {
         self.index.get()
     }
 
-    fn set(&self, index: hanns::HnswIndex) -> std::result::Result<(), hanns::HnswIndex> {
-        self.index.set(index)
+    fn get_or_init_with<F>(&self, init: F) -> Result<&hanns::HnswIndex>
+    where
+        F: FnOnce() -> Result<hanns::HnswIndex>,
+    {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+
+        let _guard = self
+            .init_lock
+            .lock()
+            .map_err(|_| Error::index("Hanns HNSW runtime cache init lock was poisoned"))?;
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+
+        let index = init()?;
+        self.index
+            .set(index)
+            .map_err(|_| Error::index("Hanns HNSW runtime cache was initialized unexpectedly"))?;
+        self.index.get().ok_or_else(|| {
+            Error::index("Hanns HnswIndex runtime cache was not initialized after deserialization")
+        })
     }
 }
 
@@ -274,15 +298,9 @@ impl HannsHnswIndex {
             return Ok(index);
         }
 
-        let index = hanns::HnswIndex::deserialize_from_bytes(&self.serialized)
-            .map_err(|e| Error::index(format!("Hanns HnswIndex::deserialize failed: {}", e)))?;
-
-        if self.runtime_cache.set(index).is_err() {
-            // Another thread populated the cache while this thread was deserializing.
-        }
-
-        self.runtime_cache.get().ok_or_else(|| {
-            Error::index("Hanns HnswIndex runtime cache was not initialized after deserialization")
+        self.runtime_cache.get_or_init_with(|| {
+            hanns::HnswIndex::deserialize_from_bytes(&self.serialized)
+                .map_err(|e| Error::index(format!("Hanns HnswIndex::deserialize failed: {}", e)))
         })
     }
 
@@ -792,6 +810,60 @@ mod tests {
             cloned.runtime_cache_ptr(),
             "clone and original should share the same cached Hanns runtime"
         );
+    }
+
+    #[test]
+    fn test_hanns_runtime_cache_shared_by_concurrent_first_searches() {
+        let dim = 32;
+        let num_vectors = 100;
+        let vectors = random_vectors(num_vectors, dim, 131415);
+
+        let params = HannsHnswBuildParams::new(16, 200);
+        let original = build_test_index(&vectors, dim, DistanceType::L2, &params, num_vectors);
+        let loaded = Arc::new(HannsHnswIndex::load(original.to_batch().unwrap()).unwrap());
+        let query = Arc::new(vectors[0..dim].to_vec());
+        let thread_count = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(thread_count));
+
+        assert!(
+            !loaded.is_runtime_cache_initialized(),
+            "loaded index should start with an empty runtime cache"
+        );
+
+        let mut handles = Vec::with_capacity(thread_count);
+        for _ in 0..thread_count {
+            let loaded = Arc::clone(&loaded);
+            let query = Arc::clone(&query);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let results = loaded.search_hanns(&query, 5, 400).unwrap();
+                assert!(
+                    !results.is_empty(),
+                    "concurrent first search should return results"
+                );
+                loaded
+                    .runtime_cache_ptr()
+                    .expect("runtime cache should be initialized after search")
+                    as usize
+            }));
+        }
+
+        let mut cache_ptrs = Vec::with_capacity(thread_count);
+        for handle in handles {
+            cache_ptrs.push(handle.join().expect("search thread should not panic"));
+        }
+
+        assert!(
+            loaded.is_runtime_cache_initialized(),
+            "concurrent first searches should initialize runtime cache"
+        );
+        for ptr in &cache_ptrs[1..] {
+            assert_eq!(
+                cache_ptrs[0], *ptr,
+                "all concurrent searches should observe the same cached Hanns runtime"
+            );
+        }
     }
 
     #[test]
