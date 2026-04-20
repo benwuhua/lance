@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use arrow::array::AsArray;
 use arrow_array::{ArrayRef, BinaryArray, Float32Array, RecordBatch, UInt64Array};
@@ -14,7 +14,6 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
@@ -75,9 +74,7 @@ pub struct HannsHnswQueryParams {
 impl From<&Query> for HannsHnswQueryParams {
     fn from(query: &Query) -> Self {
         // Use ef from query if set, otherwise default to a reasonable value based on k.
-        let ef = query
-            .ef
-            .unwrap_or_else(|| (query.k * 2).max(400));
+        let ef = query.ef.unwrap_or_else(|| (query.k * 2).max(400));
         Self { ef }
     }
 }
@@ -104,6 +101,8 @@ struct HannsMetadata {
 pub struct HannsHnswIndex {
     /// Serialized graph bytes (kept for deep_size_of and remap).
     serialized: Vec<u8>,
+    /// Runtime Hanns graph cache shared by clones.
+    runtime_cache: Arc<OnceLock<hanns::HnswIndex>>,
     /// Vector dimension.
     dim: usize,
     /// Distance type used for this index.
@@ -174,6 +173,18 @@ fn extract_flat_vectors(storage: &impl VectorStore) -> Result<(Vec<f32>, usize)>
 }
 
 impl HannsHnswIndex {
+    #[cfg(test)]
+    fn is_runtime_cache_initialized(&self) -> bool {
+        self.runtime_cache.get().is_some()
+    }
+
+    #[cfg(test)]
+    fn runtime_cache_ptr(&self) -> Option<*const hanns::HnswIndex> {
+        self.runtime_cache
+            .get()
+            .map(|index| index as *const hanns::HnswIndex)
+    }
+
     /// Build a Hanns HNSW index from raw f32 vectors.
     fn build_from_vectors(
         vectors: &[f32],
@@ -201,12 +212,13 @@ impl HannsHnswIndex {
             .add_parallel(vectors, None, None)
             .map_err(|e| Error::index(format!("Hanns HnswIndex::add_parallel failed: {}", e)))?;
 
-        let serialized = index
-            .serialize_to_bytes()
-            .map_err(|e| Error::index(format!("Hanns HnswIndex::serialize_to_bytes failed: {}", e)))?;
+        let serialized = index.serialize_to_bytes().map_err(|e| {
+            Error::index(format!("Hanns HnswIndex::serialize_to_bytes failed: {}", e))
+        })?;
 
         Ok(Self {
             serialized,
+            runtime_cache: Arc::new(OnceLock::from(index)),
             dim,
             metric_type,
             build_params: params.clone(),
@@ -214,15 +226,26 @@ impl HannsHnswIndex {
         })
     }
 
-    /// Search using the Hanns index, returning up to k results.
-    fn search_hanns(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: usize,
-    ) -> Result<Vec<(usize, f32)>> {
+    fn runtime_index(&self) -> Result<&hanns::HnswIndex> {
+        if let Some(index) = self.runtime_cache.get() {
+            return Ok(index);
+        }
+
         let index = hanns::HnswIndex::deserialize_from_bytes(&self.serialized)
             .map_err(|e| Error::index(format!("Hanns HnswIndex::deserialize failed: {}", e)))?;
+
+        if self.runtime_cache.set(index).is_err() {
+            // Another thread populated the cache while this thread was deserializing.
+        }
+
+        self.runtime_cache.get().ok_or_else(|| {
+            Error::index("Hanns HnswIndex runtime cache was not initialized after deserialization")
+        })
+    }
+
+    /// Search using the Hanns index, returning up to k results.
+    fn search_hanns(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(usize, f32)>> {
+        let index = self.runtime_index()?;
 
         let req = hanns::SearchRequest {
             top_k: k,
@@ -259,7 +282,7 @@ impl HannsHnswIndex {
                 return Err(Error::index(format!(
                     "unknown metric type in Hanns metadata: {}",
                     other
-                )))
+                )));
             }
         };
 
@@ -280,6 +303,7 @@ impl HannsHnswIndex {
 
         Ok(Self {
             serialized,
+            runtime_cache: Arc::new(OnceLock::new()),
             dim: metadata.dim,
             metric_type,
             build_params: metadata.build_params.clone(),
@@ -299,6 +323,7 @@ impl IvfSubIndex for HannsHnswIndex {
         if data.num_rows() == 0 {
             return Ok(Self {
                 serialized: Vec::new(),
+                runtime_cache: Arc::new(OnceLock::new()),
                 dim: 0,
                 metric_type: DistanceType::L2,
                 build_params: HannsHnswBuildParams::default(),
@@ -312,25 +337,22 @@ impl IvfSubIndex for HannsHnswIndex {
             .metadata()
             .get(HANNS_HNSW_METADATA_KEY)
             .ok_or_else(|| {
-                Error::index(format!("{} not found in schema metadata", HANNS_HNSW_METADATA_KEY))
-            })?;
-        let metadata: HannsMetadata =
-            serde_json::from_str(metadata_json).map_err(|e| {
                 Error::index(format!(
-                    "Failed to parse Hanns metadata: {}, json: {}",
-                    e, metadata_json
+                    "{} not found in schema metadata",
+                    HANNS_HNSW_METADATA_KEY
                 ))
             })?;
+        let metadata: HannsMetadata = serde_json::from_str(metadata_json).map_err(|e| {
+            Error::index(format!(
+                "Failed to parse Hanns metadata: {}, json: {}",
+                e, metadata_json
+            ))
+        })?;
 
         // Read serialized graph bytes from the first row of the BinaryArray column.
-        let graph_col = data
-            .column_by_name(GRAPH_DATA_COLUMN)
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "column {} not found in batch",
-                    GRAPH_DATA_COLUMN
-                ))
-            })?;
+        let graph_col = data.column_by_name(GRAPH_DATA_COLUMN).ok_or_else(|| {
+            Error::index(format!("column {} not found in batch", GRAPH_DATA_COLUMN))
+        })?;
         let binary_array = graph_col.as_binary::<i32>();
         let serialized = binary_array.value(0).to_vec();
 
@@ -346,12 +368,7 @@ impl IvfSubIndex for HannsHnswIndex {
     }
 
     fn schema() -> arrow_schema::SchemaRef {
-        Schema::new(vec![Field::new(
-            GRAPH_DATA_COLUMN,
-            DataType::Binary,
-            false,
-        )])
-        .into()
+        Schema::new(vec![Field::new(GRAPH_DATA_COLUMN, DataType::Binary, false)]).into()
     }
 
     fn search(
@@ -422,6 +439,7 @@ impl IvfSubIndex for HannsHnswIndex {
         if storage.is_empty() {
             return Ok(Self {
                 serialized: Vec::new(),
+                runtime_cache: Arc::new(OnceLock::new()),
                 dim: 0,
                 metric_type: storage.distance_type(),
                 build_params: params,
@@ -445,18 +463,12 @@ impl IvfSubIndex for HannsHnswIndex {
         let mut index = Self::build_from_vectors(&vectors, dim, metric_type, &params)?;
 
         // Collect row ID mapping: node i -> storage.row_id(i).
-        index.node_to_rowid = (0..num_vectors)
-            .map(|i| storage.row_id(i as u32))
-            .collect();
+        index.node_to_rowid = (0..num_vectors).map(|i| storage.row_id(i as u32)).collect();
 
         Ok(index)
     }
 
-    fn remap(
-        &self,
-        _mapping: &HashMap<u64, Option<u64>>,
-        store: &impl VectorStore,
-    ) -> Result<Self>
+    fn remap(&self, _mapping: &HashMap<u64, Option<u64>>, store: &impl VectorStore) -> Result<Self>
     where
         Self: Sized,
     {
@@ -482,7 +494,7 @@ impl IvfSubIndex for HannsHnswIndex {
                 return Err(Error::index(format!(
                     "unsupported metric type for Hanns HNSW: {:?}",
                     other
-                )))
+                )));
             }
         };
 
@@ -507,7 +519,10 @@ impl IvfSubIndex for HannsHnswIndex {
         // Store serialized bytes as a single-row BinaryArray.
         let binary_array = BinaryArray::from(vec![self.serialized.as_slice()]);
 
-        Ok(RecordBatch::try_new(Arc::new(schema), vec![Arc::new(binary_array)])?)
+        Ok(RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(binary_array)],
+        )?)
     }
 }
 
@@ -574,7 +589,10 @@ mod tests {
         }
 
         // The first result should have the smallest distance.
-        let min_dist = results.iter().map(|(_, d)| *d).fold(f32::INFINITY, f32::min);
+        let min_dist = results
+            .iter()
+            .map(|(_, d)| *d)
+            .fold(f32::INFINITY, f32::min);
         assert!(
             (results[0].1 - min_dist).abs() < 1e-6,
             "first result should have the smallest distance: first={} min={}",
@@ -640,10 +658,7 @@ mod tests {
             "loaded index should return same number of results"
         );
         for (orig, loaded) in original_results.iter().zip(loaded_results.iter()) {
-            assert_eq!(
-                orig.0, loaded.0,
-                "node IDs should match after roundtrip"
-            );
+            assert_eq!(orig.0, loaded.0, "node IDs should match after roundtrip");
             assert!(
                 (orig.1 - loaded.1).abs() < 1e-6,
                 "distances should match after roundtrip: {} vs {}",
@@ -651,6 +666,88 @@ mod tests {
                 loaded.1
             );
         }
+    }
+
+    #[test]
+    fn test_hanns_runtime_cache() {
+        let dim = 32;
+        let num_vectors = 100;
+        let vectors = random_vectors(num_vectors, dim, 456);
+
+        let params = HannsHnswBuildParams::new(16, 200);
+        let original = build_test_index(&vectors, dim, DistanceType::L2, &params, num_vectors);
+        assert!(
+            original.is_runtime_cache_initialized(),
+            "newly built index should seed the runtime cache"
+        );
+        let loaded = HannsHnswIndex::load(original.to_batch().unwrap()).unwrap();
+        let query = &vectors[0..dim];
+
+        assert!(
+            !loaded.is_runtime_cache_initialized(),
+            "loaded index should start with an empty runtime cache"
+        );
+
+        let first_results = loaded.search_hanns(query, 5, 400).unwrap();
+        assert!(
+            loaded.is_runtime_cache_initialized(),
+            "loaded index should initialize its runtime cache after first search"
+        );
+        let first_cache_ptr = loaded
+            .runtime_cache_ptr()
+            .expect("runtime cache should be initialized after first search");
+
+        let second_results = loaded.search_hanns(query, 5, 400).unwrap();
+        let second_cache_ptr = loaded
+            .runtime_cache_ptr()
+            .expect("runtime cache should remain initialized after second search");
+
+        assert_eq!(
+            first_cache_ptr, second_cache_ptr,
+            "second search should reuse the cached Hanns runtime"
+        );
+        assert_eq!(
+            first_results, second_results,
+            "caching should not change Hanns search results"
+        );
+    }
+
+    #[test]
+    fn test_hanns_runtime_cache_shared_by_clone() {
+        let dim = 32;
+        let num_vectors = 100;
+        let vectors = random_vectors(num_vectors, dim, 789);
+
+        let params = HannsHnswBuildParams::new(16, 200);
+        let original = build_test_index(&vectors, dim, DistanceType::L2, &params, num_vectors);
+        let loaded = HannsHnswIndex::load(original.to_batch().unwrap()).unwrap();
+        let cloned = loaded.clone();
+        let query = &vectors[0..dim];
+
+        assert!(
+            !loaded.is_runtime_cache_initialized(),
+            "loaded index should start with an empty runtime cache"
+        );
+        assert!(
+            !cloned.is_runtime_cache_initialized(),
+            "clone should observe the same empty runtime cache before search"
+        );
+
+        cloned.search_hanns(query, 5, 400).unwrap();
+
+        assert!(
+            loaded.is_runtime_cache_initialized(),
+            "original loaded index should observe cache initialized by clone"
+        );
+        assert!(
+            cloned.is_runtime_cache_initialized(),
+            "searched clone should observe initialized cache"
+        );
+        assert_eq!(
+            loaded.runtime_cache_ptr(),
+            cloned.runtime_cache_ptr(),
+            "clone and original should share the same cached Hanns runtime"
+        );
     }
 
     #[test]
