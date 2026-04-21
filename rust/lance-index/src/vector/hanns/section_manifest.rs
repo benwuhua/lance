@@ -37,6 +37,18 @@ pub struct HannsManifestFeatures {
     pub compressed_vectors: bool,
 }
 
+/// One named payload section in a Hanns sectioned snapshot artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HannsSectionDescriptor {
+    /// Stable section name used by the Hanns snapshot loader.
+    pub name: String,
+    /// Section payload length in bytes.
+    pub len: u64,
+    /// Optional payload checksum advertised by Hanns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+}
+
 /// Minimal Hanns sectioned snapshot manifest shape needed by Lance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HannsSectionManifest {
@@ -58,6 +70,9 @@ pub struct HannsSectionManifest {
     /// Storage planning feature flags.
     #[serde(default)]
     pub features: HannsManifestFeatures,
+    /// Named payload sections in the artifact.
+    #[serde(default)]
+    pub sections: Vec<HannsSectionDescriptor>,
 }
 
 /// Storage planning hints derived from Hanns manifest capabilities.
@@ -73,6 +88,8 @@ pub struct HannsSectionStoragePlan {
     pub has_quantized_payload: bool,
     /// True when compressed vector payloads are present.
     pub has_compressed_vectors: bool,
+    /// Number of section descriptors advertised by the manifest.
+    pub section_count: usize,
 }
 
 impl HannsSectionManifest {
@@ -95,7 +112,31 @@ impl HannsSectionManifest {
             has_graph_payload: self.features.graph_payload,
             has_quantized_payload: self.features.quantized_payload,
             has_compressed_vectors: self.features.compressed_vectors,
+            section_count: self.sections.len(),
         }
+    }
+
+    /// Return the section descriptor with `name`, if present.
+    pub fn section(&self, name: &str) -> Option<&HannsSectionDescriptor> {
+        self.sections.iter().find(|section| section.name == name)
+    }
+
+    /// Return true when the manifest advertises a section with `name`.
+    pub fn has_section(&self, name: &str) -> bool {
+        self.section(name).is_some()
+    }
+
+    /// Validate that all `required_sections` are advertised by this manifest.
+    pub fn validate_sections_present(&self, required_sections: &[&str]) -> Result<()> {
+        for section in required_sections {
+            if !self.has_section(section) {
+                return Err(Error::index(format!(
+                    "Hanns manifest variant {} is missing required section {}",
+                    self.variant, section
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Validate that this artifact can be consumed through Lance's current owned-memory adapter path.
@@ -145,7 +186,10 @@ mod tests {
                 "quantized_payload": true,
                 "compressed_vectors": true
             },
-            "sections": []
+            "sections": [
+                {"name": "pqflash.meta.json", "len": 128},
+                {"name": "pqflash.node_pq_codes.u8", "len": 4096, "checksum": "sha256:abc"}
+            ]
         }"#;
 
         let manifest = HannsSectionManifest::from_json(json).expect("manifest should parse");
@@ -157,6 +201,13 @@ mod tests {
         assert!(plan.has_graph_payload);
         assert!(plan.has_quantized_payload);
         assert!(plan.has_compressed_vectors);
+        assert_eq!(plan.section_count, 2);
+        assert_eq!(
+            manifest
+                .section("pqflash.node_pq_codes.u8")
+                .and_then(|section| section.checksum.as_deref()),
+            Some("sha256:abc")
+        );
         manifest
             .validate_for_lance_owned_memory()
             .expect("owned-memory manifest should validate");
@@ -186,6 +237,7 @@ mod tests {
         assert!(!plan.has_graph_payload);
         assert!(!plan.has_quantized_payload);
         assert!(!plan.has_compressed_vectors);
+        assert_eq!(plan.section_count, 0);
     }
 
     #[test]
@@ -208,6 +260,35 @@ mod tests {
 
         assert!(
             error.to_string().contains("owned-memory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validates_required_sections_present() {
+        let json = r#"{
+            "version": 1,
+            "family": "hnsw",
+            "variant": "hnsw_sections_v1",
+            "dim": 8,
+            "metric": "l2",
+            "count": 2,
+            "sections": [
+                {"name": "hnsw.meta.json", "len": 48},
+                {"name": "hnsw.vectors.f32", "len": 64}
+            ]
+        }"#;
+
+        let manifest = HannsSectionManifest::from_json(json).expect("manifest should parse");
+        manifest
+            .validate_sections_present(&["hnsw.meta.json", "hnsw.vectors.f32"])
+            .expect("required sections should validate");
+
+        let error = manifest
+            .validate_sections_present(&["hnsw.neighbors.ids.i64"])
+            .expect_err("missing section should be rejected");
+        assert!(
+            error.to_string().contains("hnsw.neighbors.ids.i64"),
             "unexpected error: {error}"
         );
     }
