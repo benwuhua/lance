@@ -38,8 +38,9 @@ impl Transformer for USQTransformer {
             .enumerate()
             .rev()
             .find(|(_, col)| {
-                col.as_fixed_size_list_opt()
-                    .is_some_and(|fsl| matches!(fsl.value_type(), arrow_schema::DataType::Float32))
+                col.as_fixed_size_list_opt().map_or(false, |fsl| {
+                    matches!(fsl.value_type(), arrow_schema::DataType::Float32)
+                })
             })
             .ok_or_else(|| Error::index("USQ: no float32 vector column found"))?;
         let vec_col_name = schema.field(vec_col_idx).name().clone();
@@ -92,10 +93,7 @@ impl Transformer for USQTransformer {
         let schema = arrow_schema::Schema::new(fields);
         let columns: Vec<ArrayRef> = arrays.into_iter().map(|(_, arr)| arr).collect();
 
-        Ok(arrow_array::RecordBatch::try_new(
-            Arc::new(schema),
-            columns,
-        )?)
+        Ok(arrow_array::RecordBatch::try_new(Arc::new(schema), columns)?)
     }
 }
 
@@ -119,7 +117,10 @@ mod tests {
             ),
             Field::new(
                 "vector",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 8),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    8,
+                ),
                 true,
             ),
         ]));
@@ -131,8 +132,8 @@ mod tests {
         let vectors = Arc::new(
             FixedSizeListArray::try_new_from_values(
                 Float32Array::from(vec![
-                    0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2,
-                    0.1,
+                    0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3,
+                    0.2, 0.1,
                 ]),
                 8,
             )

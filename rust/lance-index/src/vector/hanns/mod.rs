@@ -4,6 +4,4 @@
 //! Hanns (Knowhere-rs) integration for Lance vector indices.
 
 pub mod hnsw_index;
-pub mod section_artifact;
-pub mod section_manifest;
 pub use hnsw_index::HannsHnswIndex;

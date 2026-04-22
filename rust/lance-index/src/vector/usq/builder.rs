@@ -16,7 +16,7 @@ use rayon::prelude::*;
 
 use crate::vector::quantizer::{Quantization, Quantizer};
 use crate::vector::usq::storage::{USQStorage, UsqQuantizationMetadata};
-use crate::vector::usq::{USQ_CODE_COLUMN, USQ_META_COLUMN, USQ_METADATA_KEY, USQBuildParams};
+use crate::vector::usq::{USQBuildParams, USQ_CODE_COLUMN, USQ_META_COLUMN, USQ_METADATA_KEY};
 
 #[cfg(test)]
 static HANNS_QUANTIZER_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -50,20 +50,17 @@ struct SharedQuantizer(Arc<OnceLock<hanns::quantization::usq::UsqQuantizer>>);
 
 impl SharedQuantizer {
     fn new() -> Self {
-        Self(Arc::new(OnceLock::new()))
+        SharedQuantizer(Arc::new(OnceLock::new()))
     }
 
-    fn get_or_init(
-        &self,
-        config: hanns::quantization::usq::UsqConfig,
-    ) -> &hanns::quantization::usq::UsqQuantizer {
+    fn get_or_init(&self, config: hanns::quantization::usq::UsqConfig) -> &hanns::quantization::usq::UsqQuantizer {
         self.0.get_or_init(|| new_hanns_quantizer(config))
     }
 }
 
 impl Clone for SharedQuantizer {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+        SharedQuantizer(Arc::clone(&self.0))
     }
 }
 
@@ -109,7 +106,7 @@ impl USQuantizer {
 
     /// Padded dimension (round up to multiple of 64).
     pub fn padded_dim(&self) -> usize {
-        self.dim.div_ceil(64) * 64
+        (self.dim + 63) / 64 * 64
     }
 
     /// Code bytes per vector for packed bits.
@@ -120,9 +117,7 @@ impl USQuantizer {
     pub(crate) fn transform(&self, vectors: &FixedSizeListArray) -> Result<EncodedBatch> {
         let n = vectors.len();
         let dim = vectors.value_length() as usize;
-        let values = vectors
-            .values()
-            .as_primitive::<arrow::datatypes::Float32Type>();
+        let values = vectors.values().as_primitive::<arrow::datatypes::Float32Type>();
 
         let code_bytes = self.code_bytes();
 
@@ -132,9 +127,10 @@ impl USQuantizer {
         let mut vmaxs = Vec::with_capacity(n);
         let mut quant_qualities = Vec::with_capacity(n);
 
-        let usq_config = hanns::quantization::usq::UsqConfig::new(dim, self.num_bits)
-            .map_err(|e| Error::index(format!("USQ config error: {}", e)))?
-            .with_seed(self.rotation_seed);
+        let usq_config =
+            hanns::quantization::usq::UsqConfig::new(dim, self.num_bits)
+                .map_err(|e| Error::index(format!("USQ config error: {}", e)))?
+                .with_seed(self.rotation_seed);
 
         // Get (or lazily init) the shared quantizer — QR decomposition runs at most ONCE
         // across all batches. encode() takes &self + uses thread-local workspace, so
@@ -145,7 +141,7 @@ impl USQuantizer {
         let results: Vec<Result<EncodedVector>> = values
             .values()
             .par_chunks_exact(dim)
-            .map(|vector| Ok(encode_vector(quantizer, vector)))
+            .map(|vector| Ok(encode_vector(&quantizer, vector)))
             .collect();
 
         for (i, result) in results.into_iter().enumerate() {
@@ -332,10 +328,7 @@ mod tests {
         let batch = pool.install(|| quantizer.transform(&vectors)).unwrap();
 
         assert_eq!(batch.norms.len(), NUM_VECTORS);
-        assert_eq!(
-            batch.packed_bits.len(),
-            NUM_VECTORS * quantizer.code_bytes()
-        );
+        assert_eq!(batch.packed_bits.len(), NUM_VECTORS * quantizer.code_bytes());
 
         let init_count = HANNS_QUANTIZER_INIT_COUNT.swap(0, Ordering::Relaxed);
         assert!(
